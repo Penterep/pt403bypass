@@ -1,0 +1,2 @@
+# One JSON object per line: multiple headers sent together. Values may use {path} and {origin}
+{"X-Original-URL": "{path}", "X-Forwarded-For": "127.0.0.1"}

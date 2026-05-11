@@ -1,0 +1,8 @@
+# Protocol version tests (Vidoc-style "downgrade / try another version on the wire").
+# One token per line (aliases allowed: HTTP/2, h2, HTTP/1.1, …).
+# 1.0-no-host = HTTP/1.0 and do not send Host (legacy / ambiguous behaviour).
+2
+1.1
+1.0
+1.0-no-host
+0.9

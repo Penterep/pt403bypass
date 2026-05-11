@@ -1,0 +1,20 @@
+# Names listed under Connection: close, <name> (hop-by-hop strip; Nathan Davison / Vidoc)
+Accept
+Accept-Encoding
+Accept-Language
+Authorization
+Cookie
+Forwarded
+Host
+Origin
+Referer
+User-Agent
+X-Forwarded-For
+X-Forwarded-Host
+X-Forwarded-Proto
+X-Original-URL
+X-Real-IP
+X-Rewrite-URL
+Access-Control-Allow-Origin
+Access-Control-Allow-Headers
+Access-Control-Request-Method

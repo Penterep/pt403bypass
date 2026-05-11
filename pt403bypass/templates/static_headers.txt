@@ -1,0 +1,16 @@
+# Single extra header per line. Format: HeaderName|value  (value may use {path} and {origin})
+X-Original-URL|{path}
+X-Rewrite-URL|{path}
+X-Forwarded-Proto|https
+Referer|{origin}{path}
+X-Requested-With|XMLHttpRequest
+X-HTTP-Method-Override|GET
+X-HTTP-Method-Override|POST
+X-HTTP-Method|GET
+X-Method-Override|GET
+Authorization|Bearer null
+Authorization|Bearer undefined
+Authorization|Basic Og==
+Authorization|Basic AAAAA===
+Via|1.0 127.0.0.1
+Forwarded|for=127.0.0.1;by=127.0.0.1;proto=https
