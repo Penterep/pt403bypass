@@ -4,7 +4,7 @@
 
 Testing tool for identifying 401/403 bypass opportunities in web applications. It loads payload lists from `templates/` (verbs, headers, IPs, user agents, path fuzz strings, extensions, default credentials, and other `*.txt` lists) and runs grouped tests similar in spirit to byp4xx, with Penterep-style output.
 
-Bypass detection treats **401** and **403** as blocked responses (fixed in code). **`-s`** / **`-E`** only affect **what is printed** in the terminal, not which tests run.
+Bypass detection treats **401** and **403** as blocked responses (fixed in code). **`-s`** / **`-e`** only affect **what is printed** in the terminal, not which tests run.
 
 ## Installation
 
@@ -18,10 +18,10 @@ pip install pt403bypass
 pt403bypass -u https://example.com/admin
 pt403bypass -u https://example.com/private -vv
 pt403bypass -u https://example.com/secret -s 200 -m 500
-pt403bypass -u https://example.com/secret -E 404
+pt403bypass -u https://example.com/secret -e 404
 ```
 
-Without **`-s`**, only result lines whose HTTP status **differs from the baseline** are printed. **`-s 200`** prints only lines (and the baseline URL line, if applicable) whose status is in the given list. **`-E 404`** hides lines (and baseline) with those codes. **`-s`** and **`-E`** can be combined (must pass both filters). Use **`-vv`** / **`--verbose`** to print every line when **`-s`** is not set.
+Without **`-s`**, only result lines whose HTTP status **differs from the baseline** are printed. **`-s 200`** prints only lines (and the baseline URL line, if applicable) whose status is in the given list. **`-e 404`** hides lines (and baseline) with those codes. **`-s`** and **`-e`** can be combined (must pass both filters). Use **`-vv`** / **`--verbose`** to print every line when **`-s`** is not set.
 
 ## Options
 
