@@ -1,5 +1,5 @@
 # Path patterns for URL path fuzzing. Placeholders: {path} full path, {stripped} without leading slash,
-# {stripped_upper} / {stripped_lower} for case fuzzing (e.g. SECRETS.TXT style).
+# {stripped_upper} / {stripped_lower} for case fuzzing, {long_dot_prefix} (64× ./), {long_encoded_dot_prefix} (13× %2F%2E).
 {path}
 {path}/
 {path}//
@@ -48,3 +48,14 @@
 /%e0%80%af/{stripped}
 /{stripped}%c0%af
 /{stripped}%e0%80%af
+/.//{stripped}
+/%2e%2f%2f{stripped}
+/.;/{stripped}/./
+/foo/../{stripped}
+/foo//..//{stripped}
+/foo%2F%2E%2E%2F{stripped}
+/foo%252F%252E%252E%252F{stripped}
+/foo\..\{stripped}
+/foo\\..\\{stripped}
+/{long_dot_prefix}{stripped}
+/{long_encoded_dot_prefix}{stripped}

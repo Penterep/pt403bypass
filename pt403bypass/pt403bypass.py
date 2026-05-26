@@ -5,7 +5,8 @@ Copyright (c) 2026 Penterep Security s.r.o.
 pt403bypass - testing tool for 401/403 authorization bypass techniques.
 
 Template *.txt under templates/: source_ip_headers × ip, methods, path_patterns /
-(path_patterns placeholders: {path}, {stripped}, {stripped_upper}, {stripped_lower}),
+(path_patterns placeholders: {path}, {stripped}, {stripped_upper}, {stripped_lower},
+{long_dot_prefix}, {long_encoded_dot_prefix}),
 path_mid / path_end, extensions, static_headers, header_combos, user_agents,
 connection_strip_headers (hop-by-hop Connection fuzzing), http_protocol_versions.
 Logic and CLI live in this module.
@@ -15,15 +16,18 @@ from __future__ import annotations
 
 import argparse
 import base64
+import html
 import http.client
 import json
 import os
+import re
+import socket
 import ssl
 import sys
 import unicodedata
 
 sys.path.append(__file__.rsplit("/", 1)[0])
-from urllib.parse import quote, unquote, urlparse, urlunparse
+from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
 
 import requests
 from requests.structures import CaseInsensitiveDict
@@ -39,16 +43,158 @@ from ptlibs.http.http_client import HttpClient
 from ptlibs.ptprinthelper import ptprint
 
 
-GRAY = "\033[90m"
 WHITE = "\033[97m"
+GREEN = "\033[32m"
+RED = "\033[31m"
 RESET = "\033[0m"
 
 BLOCKED_STATUS_CODES: frozenset[int] = frozenset({401, 403})
+DEFAULT_HIDE_STATUSES: frozenset[int] = frozenset({401, 403, 404})
+
+# path_patterns.txt: long traversal prefixes (see templates/path_patterns.txt).
+LONG_DOT_PREFIX = "./" * 64
+LONG_ENCODED_DOT_PREFIX = "%2F%2E" * 13
 
 
-def _display_http_status(code: int) -> str:
+def _display_http_status(code: int, *, colorize: bool = True) -> str:
     """CLI suffix: ``[code]`` including ``[0]`` when there is no valid HTTP response."""
-    return f"[{code}]"
+    text = f"[{code}]"
+    if not colorize:
+        return text
+    if code == 200:
+        return f"{GREEN}{text}{RESET}"
+    if code == 500:
+        return f"{RED}{text}{RESET}"
+    return text
+
+
+def _is_4xx_status(code: int) -> bool:
+    return 400 <= code <= 499
+
+
+def _extract_page_title(content: bytes) -> str | None:
+    if not content:
+        return None
+    text = content.decode("utf-8", errors="replace")
+    match = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    title = html.unescape(match.group(1))
+    title = " ".join(title.split())
+    return title or None
+
+
+def _infer_http_status_from_body(raw: bytes) -> int | None:
+    """Guess status when the wire response has no HTTP status line (typical HTTP/0.9 HTML body)."""
+    if not raw or _is_proxy_artifact_response(raw):
+        return None
+    line_match = re.match(rb"HTTP/\d\.\d (\d{3})", raw)
+    if line_match:
+        return int(line_match.group(1))
+    title = _extract_page_title(raw)
+    if title:
+        title_match = re.match(r"^(\d{3})\b", title)
+        if title_match:
+            return int(title_match.group(1))
+    return None
+
+
+def _is_proxy_artifact_response(raw: bytes) -> bool:
+    """Detect proxy-generated pages (e.g. Burp CE) mistaken for a real origin response."""
+    if not raw:
+        return False
+    title = _extract_page_title(raw)
+    if title and "burp suite" in title.lower():
+        return True
+    sample = raw[:8192].decode("utf-8", errors="replace").lower()
+    return "portswigger" in sample and "burp" in sample
+
+
+def _redirect_href_from_html(content: bytes, base_url: str) -> str | None:
+    text = content.decode("utf-8", errors="replace")
+    match = re.search(r"""<a[^>]+href=["']([^"']+)["']""", text, re.IGNORECASE)
+    if not match:
+        return None
+    href = html.unescape(match.group(1).strip())
+    if not href:
+        return None
+    return urljoin(base_url, href)
+
+
+def _is_redirect_status(code: int) -> bool:
+    return 300 <= code <= 399 and code != 304
+
+
+def _redirect_target(response: requests.Response) -> str | None:
+    location = response.headers.get("Location")
+    if location:
+        return urljoin(response.url or "", location.strip())
+    if response.content:
+        return _redirect_href_from_html(response.content, response.url or "")
+    return None
+
+
+def _format_status_suffix(response: requests.Response, *, colorize: bool = True) -> str:
+    status_code = response.status_code
+    suffix = _display_http_status(status_code, colorize=colorize)
+    if status_code == 200:
+        title = _extract_page_title(response.content or b"") or "-"
+        length = len(response.content or b"")
+        suffix = f"{suffix} Title: {title} Length: {length}"
+    elif _is_redirect_status(status_code):
+        target = _redirect_target(response)
+        if target:
+            target_text = (
+                _osc8_hyperlink(target, target, link_id=_link_id_for_url(target))
+                if _is_web_url(target)
+                else target
+            )
+            suffix = f"{suffix} -> {target_text}"
+    return suffix
+
+
+def _split_label_for_output(label: str, width: int) -> tuple[list[str], str]:
+    """Split a long label into wrapped prefix lines and a final segment for status alignment."""
+    if len(label) <= width:
+        return [], label
+    prefix_lines: list[str] = []
+    rest = label
+    while len(rest) > width:
+        break_at = rest.rfind("/", 0, width + 1)
+        if break_at <= 0:
+            break_at = width
+        prefix_lines.append(rest[:break_at])
+        rest = rest[break_at:]
+    return prefix_lines, rest
+
+
+def _is_web_url(text: str) -> bool:
+    return text.startswith(("http://", "https://"))
+
+
+def _link_id_for_url(url: str) -> str:
+    return format(abs(hash(url)) & 0xFFFFFFFF, "x")
+
+
+def _osc8_hyperlink(url: str, text: str, *, link_id: str | None = None) -> str:
+    """Wrap visible text in an OSC 8 hyperlink (clickable in most modern terminals)."""
+    safe_url = url.replace("\033", "").replace("\x07", "")
+    if link_id:
+        header = f"\033]8;id={link_id};{safe_url}\033\\"
+    else:
+        header = f"\033]8;;{safe_url}\033\\"
+    return f"{header}{text}\033]8;;\033\\"
+
+
+def _format_label_text(
+    text: str,
+    width: int,
+    *,
+    link_url: str | None = None,
+    link_id: str | None = None,
+) -> str:
+    visible = _osc8_hyperlink(link_url, text, link_id=link_id) if link_url else text
+    return f"{visible}{' ' * max(0, width - len(text))}"
 
 
 def _remap_requests_exception_ptlibs(exc: requests.RequestException) -> requests.RequestException:
@@ -185,6 +331,226 @@ def _headers_without_keys(headers: dict[str, str], drop_keys: frozenset[str]) ->
     return {k: v for k, v in headers.items() if k.lower() not in dk}
 
 
+def _normalize_proxy_url(url: str) -> str:
+    if "://" not in url:
+        return f"http://{url}"
+    return url
+
+
+def _proxy_endpoint(proxy_url: str) -> tuple[str, int]:
+    parsed = urlparse(_normalize_proxy_url(proxy_url))
+    host = parsed.hostname
+    if not host:
+        raise ValueError(f"invalid proxy URL: {proxy_url}")
+    port = parsed.port or (443 if parsed.scheme == "https" else 8080)
+    return host, port
+
+
+def _read_http_response_head(sock: socket.socket, timeout: float) -> bytes:
+    sock.settimeout(timeout)
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > 65536:
+            raise OSError("HTTP response headers too large")
+    return buf
+
+
+def _proxy_connect(
+    target_host: str,
+    target_port: int,
+    proxy_url: str,
+    timeout: float,
+) -> socket.socket:
+    proxy_host, proxy_port = _proxy_endpoint(proxy_url)
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    connect_target = f"{target_host}:{target_port}"
+    req = (
+        f"CONNECT {connect_target} HTTP/1.1\r\n"
+        f"Host: {connect_target}\r\n"
+        f"Proxy-Connection: keep-alive\r\n"
+        f"\r\n"
+    )
+    try:
+        sock.sendall(req.encode("ascii", errors="strict"))
+        head = _read_http_response_head(sock, timeout)
+    except OSError:
+        sock.close()
+        raise
+    first_line = head.split(b"\r\n", 1)[0]
+    match = re.match(rb"HTTP/\d\.\d (\d{3})", first_line)
+    if not match:
+        sock.close()
+        raise OSError(f"proxy CONNECT failed: {first_line.decode('utf-8', 'replace')}")
+    status = int(match.group(1))
+    if status != 200:
+        sock.close()
+        raise OSError(f"proxy CONNECT failed: HTTP {status}")
+    return sock
+
+
+def _open_plain_target_socket(
+    host: str,
+    port: int,
+    *,
+    proxy_url: str | None,
+    timeout: float,
+) -> socket.socket:
+    if proxy_url:
+        return _proxy_connect(host, port, proxy_url, timeout)
+    return socket.create_connection((host, port), timeout=timeout)
+
+
+def _http_client_connection_from_socket(
+    sock: socket.socket,
+    host: str,
+    port: int,
+    major: int,
+    minor: int,
+    timeout: float,
+    *,
+    scheme: str,
+    ssl_context: ssl.SSLContext | None = None,
+) -> http.client.HTTPConnection:
+    conn_http, conn_https = _cached_http_connection_pair(major, minor)
+    base_cls = conn_https if scheme == "https" else conn_http
+    plain_sock = sock
+
+    class _SocketConn(base_cls):
+        def connect(self) -> None:
+            if scheme == "https":
+                if ssl_context is not None:
+                    self.sock = ssl_context.wrap_socket(plain_sock, server_hostname=host)
+                else:
+                    self.sock = plain_sock
+            else:
+                self.sock = plain_sock
+
+    conn_kw: dict = {"host": host, "port": port, "timeout": timeout}
+    if scheme == "https" and ssl_context is not None:
+        conn_kw["context"] = ssl_context
+    return _SocketConn(**conn_kw)
+
+
+def _open_target_socket(
+    host: str,
+    port: int,
+    scheme: str,
+    *,
+    proxy_url: str | None,
+    timeout: float,
+    ssl_context: ssl.SSLContext | None = None,
+) -> socket.socket:
+    sock = _open_plain_target_socket(host, port, proxy_url=proxy_url, timeout=timeout)
+    if scheme == "https":
+        ctx = ssl_context or ssl.create_default_context()
+        if ssl_context is None:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        sock = ctx.wrap_socket(sock, server_hostname=host)
+    return sock
+
+
+def _http09_wire_payload(path: str) -> bytes:
+    return f"GET {path}\r\n".encode("ascii", errors="strict")
+
+
+def _proxy_forward_request(
+    method: str,
+    absolute_url: str,
+    version: str,
+    headers: dict[str, str] | None,
+    proxy_url: str,
+    timeout: float,
+) -> bytes:
+    """Send a forward-proxy request (absolute URI) so Burp logs non-CONNECT protocol tests."""
+    proxy_host, proxy_port = _proxy_endpoint(proxy_url)
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    lines = [f"{method.upper()} {absolute_url} {version}"]
+    if headers:
+        for key, value in headers.items():
+            if key.lower() == "connection":
+                continue
+            lines.append(f"{key}: {value}")
+    lines.extend(["", ""])
+    try:
+        sock.sendall("\r\n".join(lines).encode("ascii", errors="strict"))
+        return _recv_http_bytes(sock, timeout)
+    finally:
+        sock.close()
+
+
+def _response_from_http09_raw(raw: bytes, url: str) -> requests.Response:
+    if _is_proxy_artifact_response(raw):
+        r = requests.Response()
+        r.url = url
+        r.status_code = 0
+        r._content = b"HTTP/0.9: proxy returned its own page (try direct connection or Burp tunnel settings)"
+        return r
+
+    if raw.startswith(b"HTTP/"):
+        return _parse_http_response(raw, url)
+
+    inferred = _infer_http_status_from_body(raw)
+    r = requests.Response()
+    r.url = url
+    r.status_code = inferred if inferred is not None else 200
+    r._content = raw
+    r.headers = CaseInsensitiveDict({"X-Assumed-Protocol": "HTTP/0.9"})
+    return r
+
+
+def _recv_http_bytes(sock: socket.socket, timeout: float) -> bytes:
+    sock.settimeout(timeout)
+    chunks: list[bytes] = []
+    while True:
+        try:
+            block = sock.recv(65536)
+        except socket.timeout:
+            break
+        if not block:
+            break
+        chunks.append(block)
+    return b"".join(chunks)
+
+
+def _parse_http_response(raw: bytes, url: str) -> requests.Response:
+    header_end = raw.find(b"\r\n\r\n")
+    if header_end == -1:
+        inferred = _infer_http_status_from_body(raw)
+        r = requests.Response()
+        r.url = url
+        r.status_code = inferred if inferred is not None else 200
+        r._content = raw
+        r.headers = CaseInsensitiveDict({"X-Assumed-Protocol": "HTTP/0.9"})
+        return r
+
+    head = raw[:header_end]
+    body = raw[header_end + 4 :]
+    first_line = head.split(b"\r\n", 1)[0]
+    match = re.match(rb"HTTP/\d\.\d (\d{3})", first_line)
+    status = int(match.group(1)) if match else 0
+    hdrs = CaseInsensitiveDict()
+    for line in head.split(b"\r\n")[1:]:
+        if b":" not in line:
+            continue
+        name, value = line.split(b":", 1)
+        hdrs[name.decode("latin-1", "replace").strip()] = value.decode("latin-1", "replace").strip()
+    cl = hdrs.get("Content-Length")
+    if cl and cl.isdigit():
+        want = int(cl)
+        body = body[:want]
+    r = requests.Response()
+    r.url = url
+    r.status_code = status
+    r._content = body
+    r.headers = hdrs
+    return r
+
+
 def _http_client_connection_pair(major: int, minor: int) -> tuple[type[http.client.HTTPConnection], type[http.client.HTTPSConnection]]:
     """Build ``HTTP/x.y`` request line classes for a specific minor protocol version."""
     vsn = major * 10 + minor
@@ -212,13 +578,27 @@ def _cached_http_connection_pair(major: int, minor: int) -> tuple[type, type]:
 
 
 def _parse_http_protocol_version_line(raw: str) -> str | None:
-    """Normalize one template line to: ``2`` | ``1.1`` | ``1.0`` | ``1.0-no-host`` | ``0.9``."""
+    """Normalize one template line to a protocol token.
+
+    Vidoc-style (version string in request line only — main bypass technique):
+        ``2``          → GET /path HTTP/2       (text, not binary h2)
+        ``1.1``        → GET /path HTTP/1.1
+        ``1.0``        → GET /path HTTP/1.0
+        ``1.0-no-host``→ GET /path HTTP/1.0, no Host header
+        ``0.9``        → GET /path HTTP/0.9     (text, headers still sent)
+
+    Bonus real-protocol variants (bypass value lower, included for completeness):
+        ``2-real``     → real binary HTTP/2 via httpx + ALPN
+        ``0.9-real``   → real HTTP/0.9 raw socket (GET /path\\r\\n, no headers)
+    """
     s = raw.strip()
     if not s or s.startswith("#"):
         return None
     sl = s.strip().lower().replace(" ", "")
     if sl in ("2", "http/2", "h2", "https/2"):
         return "2"
+    if sl in ("2-real", "http/2-real", "h2-real"):
+        return "2-real"
     if sl in ("1.1", "http/1.1"):
         return "1.1"
     if sl in ("1.0", "http/1.0"):
@@ -227,6 +607,8 @@ def _parse_http_protocol_version_line(raw: str) -> str | None:
         return "1.0-no-host"
     if sl in ("0.9", "http/0.9"):
         return "0.9"
+    if sl in ("0.9-real", "http/0.9-real"):
+        return "0.9-real"
     return None
 
 
@@ -243,11 +625,11 @@ def load_http_protocol_versions(templates_dir: str) -> list[str]:
 
 
 _PROTOCOL_VERSION_LABELS: dict[str, str] = {
-    "2": "GET HTTP/2",
-    "1.1": "GET HTTP/1.1",
-    "1.0": "GET HTTP/1.0",
+    "2":           "GET HTTP/2",
+    "1.1":         "GET HTTP/1.1",
+    "1.0":         "GET HTTP/1.0",
     "1.0-no-host": "GET HTTP/1.0 (no Host)",
-    "0.9": "GET HTTP/0.9",
+    "0.9":         "GET HTTP/0.9",
 }
 
 
@@ -418,6 +800,7 @@ def extra_obfuscation_paths(parsed: urlparse) -> list[tuple[str, str]]:
     if pe:
         new_last = pe + ("/" if keep_slash else "")
         add("pct-first-alpha", join_path_mid(directory, "", new_last))
+
     return rows
 
 
@@ -438,6 +821,7 @@ class Pt403Bypass:
         self.args = args
         self.findings = []
         self.output_width = 34
+        self._hide_baseline_matches = True
         self._raw_client = RawHttpClient() if RawHttpClient is not None else None
 
     def run(self) -> None:
@@ -458,11 +842,14 @@ class Pt403Bypass:
         self.output_width = self._compute_output_width(tests, extra_labels=[target])
 
         baseline_status = baseline.status_code
-        if not self.args.json and self._status_visible(baseline_status):
-            self._print_tested_url(target, baseline_status)
+        self._hide_baseline_matches = _is_4xx_status(baseline_status)
+        if not self.args.json:
+            self._print_baseline_warnings(baseline_status)
+            if self._baseline_status_visible(baseline_status):
+                self._print_tested_url(target, baseline)
 
         current_section: str | None = None
-        section_buffer: list[tuple[dict, int]] = []
+        section_buffer: list[tuple[dict, requests.Response]] = []
 
         for test in tests:
             section = self._get_section_title(test["type"])
@@ -481,7 +868,7 @@ class Pt403Bypass:
             status_code = response.status_code
 
             if not self.args.json:
-                section_buffer.append((test, status_code))
+                section_buffer.append((test, response))
 
             if self._is_bypass(baseline_status, status_code):
                 finding = {
@@ -507,27 +894,37 @@ class Pt403Bypass:
             return status_code in self.args.show_statuses
         return True
 
+    def _baseline_status_visible(self, status_code: int) -> bool:
+        """Baseline URL line ignores ``-e``; only ``-s`` can hide it."""
+        if self.args.show_statuses is not None:
+            return status_code in self.args.show_statuses
+        return True
+
     def _flush_section_buffer(
         self,
         section: str | None,
-        buffer: list[tuple[dict, int]],
+        buffer: list[tuple[dict, requests.Response]],
         baseline_status: int,
     ) -> None:
         if not buffer or section is None:
             return
-        rows = [(t, st) for t, st in buffer if self._status_visible(st)]
+        rows = [(t, r) for t, r in buffer if self._status_visible(r.status_code)]
         if not rows:
             return
         verbose = self.args.verbose
-        if not verbose and all(st == baseline_status for _, st in rows):
+        if (
+            not verbose
+            and self._hide_baseline_matches
+            and all(r.status_code == baseline_status for _, r in rows)
+        ):
             return
         ptprint(f"Testing {section}:", "INFO", condition=True, colortext=True)
-        normal = [(t, st) for t, st in rows if st != 0]
-        zeros = [(t, st) for t, st in rows if st == 0]
-        for test, st in normal:
-            self._print_test_line(test, baseline_status, st, respect_show_filter=False)
-        for test, st in zeros:
-            self._print_addition_line(test, st)
+        normal = [(t, r) for t, r in rows if r.status_code != 0]
+        zeros = [(t, r) for t, r in rows if r.status_code == 0]
+        for test, response in normal:
+            self._print_test_line(test, baseline_status, response, respect_show_filter=False)
+        for test, response in zeros:
+            self._print_addition_line(test, response)
 
     def _emit_results(self, tested_count: int) -> None:
         if self.findings:
@@ -678,6 +1075,8 @@ class Pt403Bypass:
                 stripped=stripped,
                 stripped_upper=stripped.upper(),
                 stripped_lower=stripped.lower(),
+                long_dot_prefix=LONG_DOT_PREFIX,
+                long_encoded_dot_prefix=LONG_ENCODED_DOT_PREFIX,
             )
             if not candidate.startswith("/"):
                 candidate = "/" + candidate
@@ -759,15 +1158,66 @@ class Pt403Bypass:
             return "HTTP protocol version"
         return "other tests"
 
-    def _print_tested_url(self, url: str, status_code: int) -> None:
+    def _print_baseline_warnings(self, status_code: int) -> None:
         if self.args.json:
             return
+        if status_code == 404:
+            ptprint(
+                "Baseline URL returned 404; the target may not exist. Continuing with tests.",
+                "WARNING",
+                condition=True,
+                colortext=True,
+            )
+        elif status_code == 200:
+            ptprint(
+                "Baseline URL returned 200; access may not be restricted. Continuing with tests.",
+                "WARNING",
+                condition=True,
+                colortext=True,
+            )
+
+    def _print_tested_url(self, url: str, response: requests.Response) -> None:
+        if self.args.json:
+            return
+        status_code = response.status_code
         ptprint("Tested URL", "INFO", condition=True, colortext=True)
-        line = f"{url:<{self.output_width}}  {_display_http_status(status_code)}"
         if status_code == 0:
+            line = f"{url:<{self.output_width}}  {_format_status_suffix(response)}"
             ptprint(line, "ADDITIONS", condition=not self.args.json, indent=4, colortext=True)
         else:
-            print(f"    {line}")
+            self._print_result_line(url, _format_status_suffix(response))
+
+    def _print_result_line(self, label: str, suffix: str, *, colorize: bool = False) -> None:
+        indent = "    "
+        prefix = f"{WHITE}{indent}" if colorize else indent
+        reset = RESET if colorize else ""
+        suffix_part = f"  {suffix}"
+        link_url = label if _is_web_url(label) else None
+        link_id = _link_id_for_url(link_url) if link_url else None
+
+        if len(label) <= self.output_width:
+            line = f"{_format_label_text(label, self.output_width, link_url=link_url, link_id=link_id)}{suffix_part}"
+            print(f"{prefix}{line}{reset}")
+            return
+
+        prefix_lines, last_segment = _split_label_for_output(label, self.output_width)
+        padded_last = last_segment + (" " * max(0, self.output_width - len(last_segment)))
+
+        if link_url:
+            link_visible = prefix_lines[0]
+            for chunk in prefix_lines[1:]:
+                link_visible += f"\n{indent}{chunk}"
+            if prefix_lines:
+                link_visible += f"\n{indent}{padded_last}"
+            else:
+                link_visible = padded_last
+            linked = _osc8_hyperlink(link_url, link_visible, link_id=link_id)
+            print(f"{prefix}{linked}{suffix_part}{reset}")
+            return
+
+        for chunk in prefix_lines:
+            print(f"{prefix}{chunk}{reset}")
+        print(f"{prefix}{padded_last}{suffix_part}{reset}")
 
     def _test_label(self, test: dict) -> str:
         if test.get("label"):
@@ -787,28 +1237,44 @@ class Pt403Bypass:
         self,
         test: dict,
         baseline_status: int,
-        status_code: int,
+        response: requests.Response,
         *,
         respect_show_filter: bool = True,
     ) -> None:
         if self.args.json:
             return
+        status_code = response.status_code
         if respect_show_filter and not self._status_visible(status_code):
             return
         interesting = status_code != baseline_status
-        if self.args.show_statuses is None and not interesting and not self.args.verbose:
+        if (
+            self.args.show_statuses is None
+            and self._hide_baseline_matches
+            and not interesting
+            and not self.args.verbose
+        ):
             return
         label = self._test_label(test)
-        color = WHITE if interesting else GRAY
-        print(f"{color}    {label:<{self.output_width}}  {_display_http_status(status_code)}{RESET}")
+        suffix = _format_status_suffix(response, colorize=interesting)
+        self._print_result_line(label, suffix, colorize=interesting)
 
-    def _print_addition_line(self, test: dict, status_code: int) -> None:
+    def _print_addition_line(self, test: dict, response: requests.Response) -> None:
         """Rows with HTTP status 0 (no valid response): informational only, not counted as findings."""
         if self.args.json:
             return
         label = self._test_label(test)
-        line = f"{label:<{self.output_width}}  {_display_http_status(status_code)}"
-        ptprint(line, "ADDITIONS", condition=not self.args.json, indent=4, colortext=True)
+        suffix = _display_http_status(response.status_code)
+        detail = (response.content or b"").decode("utf-8", "replace").strip()
+        if detail:
+            detail = " ".join(detail.split())
+            if len(detail) > 72:
+                detail = detail[:69] + "..."
+            suffix = f"{suffix} {detail}"
+        if len(label) <= self.output_width:
+            line = f"{label:<{self.output_width}}  {suffix}"
+            ptprint(line, "ADDITIONS", condition=not self.args.json, indent=4, colortext=True)
+        else:
+            self._print_result_line(label, suffix)
 
     def _compute_output_width(self, tests: list, extra_labels: list | None = None) -> int:
         labels = list(extra_labels) if extra_labels else []
@@ -827,13 +1293,13 @@ class Pt403Bypass:
             return True
         return candidate < baseline
 
-    def _httpx_proxies(self) -> dict | str | None:
+    def _proxy_url(self) -> str | None:
         if not self.args.proxy:
             return None
         p = self.args.proxy.get("https") or self.args.proxy.get("http")
         if not p:
             return None
-        return {"http://": p, "https://": p}
+        return _normalize_proxy_url(p)
 
     def _adapt_httpx_to_requests(self, resp) -> requests.Response:
         """Map ``httpx.Response`` to a minimal ``requests.Response`` (status, body, headers, url)."""
@@ -844,6 +1310,124 @@ class Pt403Bypass:
         r.url = str(resp.url)
         return r
 
+    def _send_http2_via_connect_tunnel(
+        self,
+        url: str,
+        method: str,
+        headers: dict,
+        auth: tuple[str, str] | None,
+    ) -> requests.Response:
+        """HTTP/2 probe through CONNECT so Burp logs the same tunnel traffic as HTTP/1.x tests."""
+        parsed = urlparse(url)
+        scheme = (parsed.scheme or "http").lower()
+        dummy = requests.Response()
+        dummy.url = url
+        if scheme not in ("http", "https"):
+            dummy.status_code = 0
+            dummy._content = b"HTTP/2: unsupported URL scheme"
+            return dummy
+
+        host = parsed.hostname
+        if not host:
+            dummy.status_code = 0
+            dummy._content = b"HTTP/2: missing hostname"
+            return dummy
+
+        port = parsed.port or (443 if scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+
+        proxy_url = self._proxy_url()
+        if not proxy_url:
+            dummy.status_code = 0
+            dummy._content = b"HTTP/2: proxy URL missing"
+            return dummy
+
+        hdrs: dict[str, str] = {str(k): str(v) for k, v in headers.items()}
+        if auth is not None:
+            token = base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
+            hdrs["Authorization"] = f"Basic {token}"
+
+        timeout = self.args.timeout
+        tunneled_sock: socket.socket | None = None
+
+        try:
+            if scheme == "https":
+                # FIX: Only advertise http/1.1 via ALPN so that http.client (which speaks
+                # HTTP/1.x text framing) can parse the response correctly.
+                # Advertising "h2" here causes the server to respond with binary HTTP/2
+                # frames that http.client.getresponse() cannot parse, resulting in a
+                # BadStatusLine exception and status_code = 0.
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                ssl_ctx.set_alpn_protocols(["http/1.1"])
+
+                tunneled_sock = _open_plain_target_socket(
+                    host, port, proxy_url=proxy_url, timeout=timeout,
+                )
+                conn = _http_client_connection_from_socket(
+                    tunneled_sock,
+                    host,
+                    port,
+                    1,
+                    1,
+                    timeout,
+                    scheme="https",
+                    ssl_context=ssl_ctx,
+                )
+                conn.request(method.upper(), path, body=None, headers=hdrs)
+                resp = conn.getresponse()
+                data = resp.read()
+                negotiated = None
+                if getattr(conn, "sock", None) is not None:
+                    negotiated = conn.sock.selected_alpn_protocol()
+                conn.close()
+                r = requests.Response()
+                r.status_code = resp.status
+                r._content = data
+                r.headers = CaseInsensitiveDict(dict(resp.headers))
+                if negotiated:
+                    r.headers["X-Negotiated-Protocol"] = negotiated
+                r.url = url
+                return r
+
+            tunneled_sock = _open_plain_target_socket(
+                host, port, proxy_url=proxy_url, timeout=timeout,
+            )
+            hdrs.setdefault("Host", host)
+            h2_settings = "AAMAAABkAAQCAAQA="
+            lines = [f"{method.upper()} {path} HTTP/1.1"]
+            for key, value in hdrs.items():
+                if key.lower() == "connection":
+                    continue
+                lines.append(f"{key}: {value}")
+            lines.extend([
+                "Connection: Upgrade, HTTP2-Settings",
+                "Upgrade: h2c",
+                f"HTTP2-Settings: {h2_settings}",
+                "",
+                "",
+            ])
+            tunneled_sock.sendall("\r\n".join(lines).encode("ascii", errors="strict"))
+            raw = _recv_http_bytes(tunneled_sock, timeout)
+            r = _parse_http_response(raw, url)
+            r.headers["X-Requested-Protocol"] = "h2c"
+            return r
+        except (OSError, TimeoutError, http.client.HTTPException, ssl.SSLError, ValueError) as exc:
+            dummy.status_code = 0
+            dummy._content = str(exc).encode()
+            if self.args.verbose:
+                ptprint(f"HTTP/2 (CONNECT) request failed ({url}): {exc}", "INFO", condition=True, colortext=True)
+            return dummy
+        finally:
+            if tunneled_sock is not None:
+                try:
+                    tunneled_sock.close()
+                except OSError:
+                    pass
+
     def _send_http2_httpx(
         self,
         url: str,
@@ -852,6 +1436,9 @@ class Pt403Bypass:
         auth: tuple[str, str] | None,
     ) -> requests.Response:
         """HTTP/2 over ALPN (requires ``httpx`` + ``h2``)."""
+        if self._proxy_url():
+            return self._send_http2_via_connect_tunnel(url, method, headers, auth)
+
         dummy = requests.Response()
         dummy.url = url
         try:
@@ -861,13 +1448,16 @@ class Pt403Bypass:
             dummy._content = b"HTTP/2: install httpx and h2 (e.g. pip install 'httpx[http2]')"
             return dummy
         try:
-            with httpx.Client(
-                http2=True,
-                verify=False,
-                proxies=self._httpx_proxies(),
-                timeout=self.args.timeout,
-                trust_env=False,
-            ) as client:
+            client_kw: dict = {
+                "http2": True,
+                "verify": False,
+                "timeout": self.args.timeout,
+                "trust_env": False,
+            }
+            proxy = self._proxy_url()
+            if proxy:
+                client_kw["proxy"] = proxy
+            with httpx.Client(**client_kw) as client:
                 r = client.request(method.upper(), url, headers=headers, auth=auth)
             return self._adapt_httpx_to_requests(r)
         except Exception as exc:
@@ -921,17 +1511,39 @@ class Pt403Bypass:
             ssl_ctx.check_hostname = False
             ssl_ctx.verify_mode = ssl.CERT_NONE
 
-        conn_http, conn_https = _cached_http_connection_pair(major, minor)
-        conn_cls = conn_https if scheme == "https" else conn_http
-        conn_kw: dict = {"host": host, "port": port, "timeout": timeout}
-        if scheme == "https" and ssl_ctx is not None:
-            conn_kw["context"] = ssl_ctx
+        proxy_url = self._proxy_url()
+        tunneled_sock: socket.socket | None = None
 
         try:
-            conn = conn_cls(**conn_kw)
-            if no_host:
-                strip = _headers_without_keys(hdrs, frozenset({"host"}))
+            if proxy_url:
+                tunneled_sock = _open_plain_target_socket(
+                    host,
+                    port,
+                    proxy_url=proxy_url,
+                    timeout=timeout,
+                )
+                conn = _http_client_connection_from_socket(
+                    tunneled_sock,
+                    host,
+                    port,
+                    major,
+                    minor,
+                    timeout,
+                    scheme=scheme,
+                    ssl_context=ssl_ctx if scheme == "https" else None,
+                )
+            else:
+                conn_http, conn_https = _cached_http_connection_pair(major, minor)
+                conn_cls = conn_https if scheme == "https" else conn_http
+                conn_kw: dict = {"host": host, "port": port, "timeout": timeout}
+                if scheme == "https" and ssl_ctx is not None:
+                    conn_kw["context"] = ssl_ctx
+                conn = conn_cls(**conn_kw)
+            if no_host or (major == 1 and minor == 0):
+                strip = _headers_without_keys(hdrs, frozenset({"host", "connection"}))
                 conn.putrequest(method.upper(), path, skip_host=True)
+                if not no_host and host:
+                    conn.putheader("Host", host)
                 for k, v in strip.items():
                     conn.putheader(k, v)
                 conn.endheaders()
@@ -941,7 +1553,7 @@ class Pt403Bypass:
                 resp = conn.getresponse()
             data = resp.read()
             conn.close()
-        except (OSError, TimeoutError, http.client.HTTPException, ssl.SSLError) as exc:
+        except (OSError, TimeoutError, http.client.HTTPException, ssl.SSLError, ValueError) as exc:
             dummy.status_code = 0
             dummy._content = str(exc).encode()
             if self.args.verbose:
@@ -954,6 +1566,12 @@ class Pt403Bypass:
             r.headers = CaseInsensitiveDict(dict(resp.headers))
             r.url = url
             return r
+        finally:
+            if tunneled_sock is not None:
+                try:
+                    tunneled_sock.close()
+                except OSError:
+                    pass
 
     def _send_http09(
         self,
@@ -962,9 +1580,6 @@ class Pt403Bypass:
         auth: tuple[str, str] | None,
     ) -> requests.Response:
         """HTTP/0.9: ``GET path`` only; response may be raw HTML or upgraded HTTP/1.x."""
-        import re
-        import socket as socket_mod
-
         dummy = requests.Response()
         dummy.url = url
         if auth is not None:
@@ -990,54 +1605,48 @@ class Pt403Bypass:
         if parsed.query:
             path = f"{path}?{parsed.query}"
 
+        proxy_url = self._proxy_url()
+        timeout = self.args.timeout
+
+        if proxy_url and scheme == "http":
+            if self.args.verbose:
+                ptprint(
+                    "HTTP/0.9 via proxy sends non-standard request line; proxy may reject it.",
+                    "INFO",
+                    condition=True,
+                    colortext=True,
+                )
+            hdrs = {str(k): str(v) for k, v in headers.items()}
+            raw = _proxy_forward_request("GET", url, "HTTP/0.9", hdrs, proxy_url, timeout)
+            return _response_from_http09_raw(raw, url)
+
         try:
-            sock = socket_mod.create_connection((host, port), timeout=self.args.timeout)
-        except OSError as exc:
+            ssl_ctx: ssl.SSLContext | None = None
+            if scheme == "https":
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+
+            sock = _open_target_socket(
+                host,
+                port,
+                scheme,
+                proxy_url=proxy_url,
+                timeout=timeout,
+                ssl_context=ssl_ctx,
+            )
+        except (OSError, ValueError) as exc:
             dummy.status_code = 0
             dummy._content = str(exc).encode()
             return dummy
 
         try:
-            if scheme == "https":
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                sock = ctx.wrap_socket(sock, server_hostname=host)
-            sock.sendall(f"GET {path}\r\n".encode("ascii", errors="strict"))
-            sock.settimeout(self.args.timeout)
-            chunks: list[bytes] = []
-            while True:
-                try:
-                    block = sock.recv(65536)
-                except socket_mod.timeout:
-                    break
-                if not block:
-                    break
-                chunks.append(block)
+            sock.sendall(_http09_wire_payload(path))
+            raw = _recv_http_bytes(sock, timeout)
         finally:
             sock.close()
 
-        raw = b"".join(chunks)
-        m = re.match(rb"HTTP/\d\.\d (\d{3})", raw)
-        if m:
-            st = int(m.group(1))
-            body = raw
-            header_end = raw.find(b"\r\n\r\n")
-            if header_end != -1:
-                body = raw[header_end + 4 :]
-            r = requests.Response()
-            r.status_code = st
-            r._content = body
-            r.headers = CaseInsensitiveDict()
-            r.url = url
-            return r
-
-        r = requests.Response()
-        r.status_code = 200
-        r._content = raw
-        r.headers = CaseInsensitiveDict({"X-Assumed-Protocol": "HTTP/0.9"})
-        r.url = url
-        return r
+        return _response_from_http09_raw(raw, url)
 
     def _send_by_protocol_version(
         self,
@@ -1048,21 +1657,19 @@ class Pt403Bypass:
         auth: tuple[str, str] | None,
     ) -> requests.Response:
         if token == "2":
-            return self._send_http2_httpx(url, method, headers, auth)
+            # Sends: GET /admin HTTP/2\r\nHost: ...\r\n...
+            return self._send_via_http_client(url, method, headers, auth, major=2, minor=0, no_host=False)
         if token == "1.1":
             return self._send_via_http_client(url, method, headers, auth, major=1, minor=1, no_host=False)
         if token == "1.0":
             return self._send_via_http_client(url, method, headers, auth, major=1, minor=0, no_host=False)
         if token == "1.0-no-host":
+            # Sends HTTP/1.0 without Host header — can trigger unexpected server behaviour.
             return self._send_via_http_client(url, method, headers, auth, major=1, minor=0, no_host=True)
         if token == "0.9":
-            if method.upper() != "GET":
-                d = requests.Response()
-                d.status_code = 0
-                d.url = url
-                d._content = b"HTTP/0.9: only GET"
-                return d
-            return self._send_http09(url, headers, auth)
+            # Sends: GET /admin HTTP/0.9\r\nHost: ...\r\n...
+            return self._send_via_http_client(url, method, headers, auth, major=0, minor=9, no_host=False)
+
         d = requests.Response()
         d.status_code = 0
         d.url = url
@@ -1147,8 +1754,8 @@ def get_help():
         {"usage_example": [
             "pt403bypass -u https://www.example.com/admin",
             "pt403bypass -u https://www.example.com/private -vv -m 500",
-            "pt403bypass -u https://host/api -s 200",
-            "pt403bypass -u https://host/api -e 404 500",
+            "pt403bypass -u https://www.example.com/api -s 200",
+            "pt403bypass -u https://www.example.com/api -e 404 500",
         ]},
         {"options": [
             ["-u",  "--url",                   "<url>",           "Protected URL to test"],
@@ -1196,7 +1803,7 @@ def parse_args():
         dest="hide_statuses",
         type=int,
         nargs="+",
-        default=None,
+        default=sorted(DEFAULT_HIDE_STATUSES),
         metavar="CODE",
     )
     parser.add_argument("-x",  "--methods",        type=lambda s: s.upper(), nargs="+", default=default_methods_for_argparse())
@@ -1218,8 +1825,7 @@ def parse_args():
 
     args = parser.parse_args()
 
-    if args.hide_statuses is not None:
-        args.hide_statuses = frozenset(args.hide_statuses)
+    args.hide_statuses = frozenset(args.hide_statuses)
     if args.show_statuses is not None:
         args.show_statuses = frozenset(args.show_statuses)
 
