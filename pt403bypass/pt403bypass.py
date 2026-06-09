@@ -3,13 +3,6 @@
 Copyright (c) 2026 Penterep Security s.r.o.
 
 pt403bypass - testing tool for 401/403 authorization bypass techniques.
-
-Template *.txt under templates/: source_ip_headers × ip, methods, path_patterns /
-(path_patterns placeholders: {path}, {stripped}, {stripped_upper}, {stripped_lower},
-{long_dot_prefix}, {long_encoded_dot_prefix}),
-path_mid / path_end, extensions, static_headers, header_combos, user_agents,
-connection_strip_headers (hop-by-hop Connection fuzzing), http_protocol_versions.
-Logic and CLI live in this module.
 """
 
 from __future__ import annotations
@@ -25,6 +18,7 @@ import socket
 import ssl
 import sys
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.append(__file__.rsplit("/", 1)[0])
 from urllib.parse import quote, unquote, urljoin, urlparse, urlunparse
@@ -51,13 +45,11 @@ RESET = "\033[0m"
 BLOCKED_STATUS_CODES: frozenset[int] = frozenset({401, 403})
 DEFAULT_HIDE_STATUSES: frozenset[int] = frozenset({401, 403, 404})
 
-# path_patterns.txt: long traversal prefixes (see templates/path_patterns.txt).
 LONG_DOT_PREFIX = "./" * 64
 LONG_ENCODED_DOT_PREFIX = "%2F%2E" * 13
 
 
 def _display_http_status(code: int, *, colorize: bool = True) -> str:
-    """CLI suffix: ``[code]`` including ``[0]`` when there is no valid HTTP response."""
     text = f"[{code}]"
     if not colorize:
         return text
@@ -66,10 +58,6 @@ def _display_http_status(code: int, *, colorize: bool = True) -> str:
     if code == 500:
         return f"{RED}{text}{RESET}"
     return text
-
-
-def _is_4xx_status(code: int) -> bool:
-    return 400 <= code <= 499
 
 
 def _extract_page_title(content: bytes) -> str | None:
@@ -85,7 +73,6 @@ def _extract_page_title(content: bytes) -> str | None:
 
 
 def _infer_http_status_from_body(raw: bytes) -> int | None:
-    """Guess status when the wire response has no HTTP status line (typical HTTP/0.9 HTML body)."""
     if not raw or _is_proxy_artifact_response(raw):
         return None
     line_match = re.match(rb"HTTP/\d\.\d (\d{3})", raw)
@@ -100,7 +87,6 @@ def _infer_http_status_from_body(raw: bytes) -> int | None:
 
 
 def _is_proxy_artifact_response(raw: bytes) -> bool:
-    """Detect proxy-generated pages (e.g. Burp CE) mistaken for a real origin response."""
     if not raw:
         return False
     title = _extract_page_title(raw)
@@ -154,7 +140,6 @@ def _format_status_suffix(response: requests.Response, *, colorize: bool = True)
 
 
 def _split_label_for_output(label: str, width: int) -> tuple[list[str], str]:
-    """Split a long label into wrapped prefix lines and a final segment for status alignment."""
     if len(label) <= width:
         return [], label
     prefix_lines: list[str] = []
@@ -177,7 +162,6 @@ def _link_id_for_url(url: str) -> str:
 
 
 def _osc8_hyperlink(url: str, text: str, *, link_id: str | None = None) -> str:
-    """Wrap visible text in an OSC 8 hyperlink (clickable in most modern terminals)."""
     safe_url = url.replace("\033", "").replace("\x07", "")
     if link_id:
         header = f"\033]8;id={link_id};{safe_url}\033\\"
@@ -198,9 +182,7 @@ def _format_label_text(
 
 
 def _remap_requests_exception_ptlibs(exc: requests.RequestException) -> requests.RequestException:
-    """Same short messages as pttechnologies (ptlibs HttpClient._remap_requests_exception)."""
     try:
-        # `self` is unused inside _remap_requests_exception
         HttpClient._remap_requests_exception(None, exc)  # type: ignore[arg-type]
     except requests.RequestException as remapped:
         return remapped
@@ -304,7 +286,6 @@ def load_methods(templates_dir: str) -> list[str]:
 
 
 def default_methods_for_argparse() -> list[str]:
-    """Default -x list is templates/methods.txt (merged at runtime with explicit -x)."""
     return load_methods(_templates_dir(None))
 
 
@@ -314,7 +295,6 @@ def load_user_agents(templates_dir: str) -> list[str]:
 
 
 def load_connection_strip_header_names(templates_dir: str) -> list[str]:
-    """Header names to pair with ``Connection: close, <name>`` (hop-by-hop strip fuzzing)."""
     path = os.path.join(templates_dir, "connection_strip_headers.txt")
     names: list[str] = []
     seen: set[str] = set()
@@ -466,7 +446,6 @@ def _proxy_forward_request(
     proxy_url: str,
     timeout: float,
 ) -> bytes:
-    """Send a forward-proxy request (absolute URI) so Burp logs non-CONNECT protocol tests."""
     proxy_host, proxy_port = _proxy_endpoint(proxy_url)
     sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
     lines = [f"{method.upper()} {absolute_url} {version}"]
@@ -529,7 +508,7 @@ def _parse_http_response(raw: bytes, url: str) -> requests.Response:
         return r
 
     head = raw[:header_end]
-    body = raw[header_end + 4 :]
+    body = raw[header_end + 4:]
     first_line = head.split(b"\r\n", 1)[0]
     match = re.match(rb"HTTP/\d\.\d (\d{3})", first_line)
     status = int(match.group(1)) if match else 0
@@ -552,7 +531,6 @@ def _parse_http_response(raw: bytes, url: str) -> requests.Response:
 
 
 def _http_client_connection_pair(major: int, minor: int) -> tuple[type[http.client.HTTPConnection], type[http.client.HTTPSConnection]]:
-    """Build ``HTTP/x.y`` request line classes for a specific minor protocol version."""
     vsn = major * 10 + minor
     ver_str = f"HTTP/{major}.{minor}"
 
@@ -578,19 +556,6 @@ def _cached_http_connection_pair(major: int, minor: int) -> tuple[type, type]:
 
 
 def _parse_http_protocol_version_line(raw: str) -> str | None:
-    """Normalize one template line to a protocol token.
-
-    Vidoc-style (version string in request line only — main bypass technique):
-        ``2``          → GET /path HTTP/2       (text, not binary h2)
-        ``1.1``        → GET /path HTTP/1.1
-        ``1.0``        → GET /path HTTP/1.0
-        ``1.0-no-host``→ GET /path HTTP/1.0, no Host header
-        ``0.9``        → GET /path HTTP/0.9     (text, headers still sent)
-
-    Bonus real-protocol variants (bypass value lower, included for completeness):
-        ``2-real``     → real binary HTTP/2 via httpx + ALPN
-        ``0.9-real``   → real HTTP/0.9 raw socket (GET /path\\r\\n, no headers)
-    """
     s = raw.strip()
     if not s or s.startswith("#"):
         return None
@@ -642,7 +607,6 @@ def load_endpaths(templates_dir: str) -> list[str]:
 
 
 def _strip_unicode_format_chars(s: str) -> str:
-    """Remove Cf category chars (ZWSP, LRM, BOM, etc.) that break raw HTTP paths and confuse diffs."""
     return "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
 
 
@@ -664,7 +628,6 @@ def load_extensions(templates_dir: str) -> list[str]:
 
 
 def path_directory_and_last(parsed: urlparse) -> tuple[str, str]:
-    """Split path into (parent directory path, final segment). Final keeps trailing / if present."""
     path = parsed.path or "/"
     if path == "/":
         return "/", ""
@@ -689,7 +652,6 @@ def url_with_path(url: str, new_path: str) -> str:
 
 
 def merge_target_path(target: str, new_path: str) -> str:
-    """Apply path (and optional ?query inside new_path) to target's origin."""
     p = urlparse(target)
     if "?" in new_path:
         path_part, _, q = new_path.partition("?")
@@ -700,13 +662,6 @@ def merge_target_path(target: str, new_path: str) -> str:
 
 
 def _url_for_raw_request(url: str) -> str:
-    """Build an ASCII-only request-target for raw HTTP (spaces, Unicode/IRI → UTF-8 % escapes).
-
-    Raw sockets send ``GET <request-target> HTTP/1.1`` using bytes that must not contain arbitrary
-    Unicode: lib code paths often use ASCII. Non-ASCII in the path (e.g. ``°``) must be
-    percent-encoded (RFC 3986). We normalize by *unquoting* first so existing ``%2F``-style
-    sequences are not double-encoded, then *quote* path and query with UTF-8.
-    """
     p = urlparse(url)
     raw_path = unquote(p.path or "/")
     enc_path = quote(raw_path, safe="/")
@@ -719,7 +674,6 @@ def _url_for_raw_request(url: str) -> str:
 
 
 def apply_path_suffix(url: str, suffix: str) -> str:
-    """Append suffix to path, or merge ?suffix into query if suffix starts with ?."""
     p = urlparse(url)
     if suffix.startswith("?"):
         q = suffix[1:]
@@ -729,7 +683,6 @@ def apply_path_suffix(url: str, suffix: str) -> str:
 
 
 def join_path_mid(directory: str, mid: str, last: str) -> str:
-    """Join path segments without collapsing // (payloads may rely on double slashes)."""
     left = directory.rstrip("/")
     if mid:
         path = f"{left}/{mid}/{last}" if left else f"/{mid}/{last}"
@@ -759,16 +712,14 @@ def case_flip_variants(last_segment: str) -> list[str]:
 
 
 def percent_encode_first_alpha(segment: str) -> str | None:
-    """First path character as ``%XX`` (Vidoc-style case / normalization tricks)."""
     for i, ch in enumerate(segment):
         if ch.isalpha():
             enc = f"%{ord(ch):02x}"
-            return segment[:i] + enc + segment[i + 1 :]
+            return segment[:i] + enc + segment[i + 1:]
     return None
 
 
 def extra_obfuscation_paths(parsed: urlparse) -> list[tuple[str, str]]:
-    """Additional path tricks (same ideas as common bypass writeups)."""
     directory, last = path_directory_and_last(parsed)
     if not last:
         return []
@@ -821,8 +772,11 @@ class Pt403Bypass:
         self.args = args
         self.findings = []
         self.output_width = 34
-        self._hide_baseline_matches = True
         self._raw_client = RawHttpClient() if RawHttpClient is not None else None
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
 
     def run(self) -> None:
         target = self._normalize_target(self.args.url)
@@ -842,89 +796,183 @@ class Pt403Bypass:
         self.output_width = self._compute_output_width(tests, extra_labels=[target])
 
         baseline_status = baseline.status_code
-        self._hide_baseline_matches = _is_4xx_status(baseline_status)
         if not self.args.json:
             self._print_baseline_warnings(baseline_status)
-            if self._baseline_status_visible(baseline_status):
-                self._print_tested_url(target, baseline)
+            self._print_tested_url(target, baseline)
 
+        # Group tests by section, then execute each section with threads
+        sections: list[tuple[str, list[dict]]] = []
         current_section: str | None = None
-        section_buffer: list[tuple[dict, requests.Response]] = []
-
+        current_group: list[dict] = []
         for test in tests:
             section = self._get_section_title(test["type"])
-            if not self.args.json and section != current_section:
-                self._flush_section_buffer(current_section, section_buffer, baseline_status)
+            if section != current_section:
+                if current_group:
+                    sections.append((current_section, current_group))
                 current_section = section
-                section_buffer = []
+                current_group = []
+            current_group.append(test)
+        if current_group:
+            sections.append((current_section, current_group))
 
-            response = self._send(
-                test["url"],
-                test["method"],
-                test["headers"],
-                use_raw=test.get("use_raw", False),
-                http_proto=test.get("http_proto"),
-            )
-            status_code = response.status_code
-
-            if not self.args.json:
-                section_buffer.append((test, response))
-
-            if self._is_bypass(baseline_status, status_code):
-                finding = {
-                    "type": test["type"],
-                    "method": test["method"],
-                    "url": test["url"],
-                    "status": status_code,
-                    "headers": test["headers"],
-                }
-                if test.get("http_proto"):
-                    finding["http_proto"] = test["http_proto"]
-                self.findings.append(finding)
-
-        if not self.args.json:
-            self._flush_section_buffer(current_section, section_buffer, baseline_status)
+        for section_title, section_tests in sections:
+            self._run_section(section_title, section_tests, baseline_status)
 
         self._emit_results(len(tests))
 
+    # ------------------------------------------------------------------
+    # Section execution with threads + immediate output
+    # ------------------------------------------------------------------
+
+    def _run_section(
+        self,
+        section_title: str,
+        tests: list[dict],
+        baseline_status: int,
+    ) -> None:
+        """Run all tests in a section using a thread pool; print results as they arrive."""
+        # Submit all requests concurrently; preserve arrival order for output via future map
+        max_workers = min(10, len(tests))
+        futures: list = []  # (future, test)
+
+        header_printed = False
+
+        # We need results in submission order so that the same-type tests stay grouped.
+        # Use a simple ordered-results approach: collect (index, test, response) tuples.
+        results: list[tuple[int, dict, requests.Response]] = []
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_idx: dict = {}
+            for idx, test in enumerate(tests):
+                f = executor.submit(
+                    self._send,
+                    test["url"],
+                    test["method"],
+                    test["headers"],
+                    None,
+                    use_raw=test.get("use_raw", False),
+                    http_proto=test.get("http_proto"),
+                )
+                future_to_idx[f] = idx
+
+            for f in as_completed(future_to_idx):
+                idx = future_to_idx[f]
+                test = tests[idx]
+                try:
+                    response = f.result()
+                except Exception as exc:
+                    response = requests.Response()
+                    response.status_code = 0
+                    response._content = str(exc).encode()
+                    response.url = test["url"]
+
+                results.append((idx, test, response))
+
+                status_code = response.status_code
+
+                # Findings
+                if self._is_bypass(baseline_status, status_code):
+                    finding = {
+                        "type": test["type"],
+                        "method": test["method"],
+                        "url": test["url"],
+                        "status": status_code,
+                        "headers": test["headers"],
+                    }
+                    if test.get("http_proto"):
+                        finding["http_proto"] = test["http_proto"]
+                    self.findings.append(finding)
+
+                # Immediate CLI output
+                if not self.args.json:
+                    should_print, as_addition = self._should_print_result(test, response, baseline_status)
+                    if should_print:
+                        if not header_printed:
+                            ptprint(f"Testing {section_title}:", "INFO", condition=True, colortext=True)
+                            header_printed = True
+                        if as_addition:
+                            self._print_addition_line(test, response)
+                        else:
+                            self._print_test_line(test, baseline_status, response, respect_show_filter=False)
+
+    # ------------------------------------------------------------------
+    # Visibility / filter helpers
+    # ------------------------------------------------------------------
+
+    def _is_default_hidden_status(self, status_code: int) -> bool:
+        """401/403/404 are never printed unless explicitly whitelisted via -s."""
+        if status_code not in DEFAULT_HIDE_STATUSES:
+            return False
+        if self.args.show_statuses is not None and status_code in self.args.show_statuses:
+            return False
+        return True
+
+    def _is_suppressed_by_hide_flag(self, status_code: int) -> bool:
+        if not self.args.hide_statuses or status_code not in self.args.hide_statuses:
+            return False
+        if self.args.show_statuses is not None and status_code in self.args.show_statuses:
+            return False
+        return True
+
+    def _is_status_hidden(self, status_code: int) -> bool:
+        if self._is_default_hidden_status(status_code):
+            return True
+        if self.args.verbose:
+            return False
+        return self._is_suppressed_by_hide_flag(status_code)
+
+    def _should_print_result(
+        self,
+        test: dict,
+        response: requests.Response,
+        baseline_status: int,
+    ) -> tuple[bool, bool]:
+        """Return (should_print, as_addition).
+
+        Rules (in priority order):
+        1. status_code == 0  → always print as ADDITIONS (no filter applied).
+        2. 401/403/404         → never print unless listed in -s (all modes, including -vv).
+        3. -vv (verbose)     → print remaining lines; same-as-baseline as ADDITIONS.
+        4. -e filter         → skip in normal mode only.
+        5. -s filter         → only print if status in show_statuses.
+        6. Baseline status filter (no -vv): skip if status matches baseline.
+        """
+        status_code = response.status_code
+
+        # Rule 1: no valid HTTP response
+        if status_code == 0:
+            return True, True
+
+        # Rule 2: 401/403/404 unless explicitly -s
+        if self._is_default_hidden_status(status_code):
+            return False, False
+
+        verbose = self.args.verbose
+
+        # Rule 3: verbose mode — show everything else; same status as baseline as ADDITIONS
+        if verbose:
+            return True, status_code == baseline_status
+
+        # Rule 4: -e (normal mode only; -s overrides -e for the same code)
+        if self._is_suppressed_by_hide_flag(status_code):
+            return False, False
+
+        # Rule 5: -s (show_statuses whitelist; -s overrides baseline-status dedup)
+        if self.args.show_statuses is not None:
+            return status_code in self.args.show_statuses, False
+
+        # Rule 6: same HTTP status as baseline
+        if status_code == baseline_status:
+            return False, False
+
+        return True, False
+
     def _status_visible(self, status_code: int) -> bool:
-        if self.args.hide_statuses and status_code in self.args.hide_statuses:
+        if self._is_status_hidden(status_code):
             return False
         if self.args.show_statuses is not None:
             return status_code in self.args.show_statuses
         return True
-
-    def _baseline_status_visible(self, status_code: int) -> bool:
-        """Baseline URL line ignores ``-e``; only ``-s`` can hide it."""
-        if self.args.show_statuses is not None:
-            return status_code in self.args.show_statuses
-        return True
-
-    def _flush_section_buffer(
-        self,
-        section: str | None,
-        buffer: list[tuple[dict, requests.Response]],
-        baseline_status: int,
-    ) -> None:
-        if not buffer or section is None:
-            return
-        rows = [(t, r) for t, r in buffer if self._status_visible(r.status_code)]
-        if not rows:
-            return
-        verbose = self.args.verbose
-        if (
-            not verbose
-            and self._hide_baseline_matches
-            and all(r.status_code == baseline_status for _, r in rows)
-        ):
-            return
-        ptprint(f"Testing {section}:", "INFO", condition=True, colortext=True)
-        normal = [(t, r) for t, r in rows if r.status_code != 0]
-        zeros = [(t, r) for t, r in rows if r.status_code == 0]
-        for test, response in normal:
-            self._print_test_line(test, baseline_status, response, respect_show_filter=False)
-        for test, response in zeros:
-            self._print_addition_line(test, response)
 
     def _emit_results(self, tested_count: int) -> None:
         if self.findings:
@@ -1023,7 +1071,6 @@ class Pt403Bypass:
             lbl = " + ".join(rendered.keys())
             add("header", "GET", target, m, header=rendered, label=lbl, use_raw=False)
 
-        # iamj0ker/bypass-403.sh: curl $1 -H "X-rewrite-url: $2" (GET origin / only; path in header)
         root_url = urlunparse(parsed._replace(path="/", params="", query="", fragment=""))
         rewrite_variants: list[str] = [stripped, "/" + stripped]
         seen_rw: set[str] = set()
@@ -1043,7 +1090,6 @@ class Pt403Bypass:
                 use_raw=False,
             )
 
-        # iamj0ker/bypass-403.sh: POST + Content-Length: 0
         m_cl = base_headers.copy()
         m_cl["Content-Length"] = "0"
         add(
@@ -1055,7 +1101,6 @@ class Pt403Bypass:
             use_raw=False,
         )
 
-        # Hop-by-hop: ask intermediaries to strip named headers (Vidoc / Nathan Davison style)
         for h_strip in load_connection_strip_header_names(tdir):
             m = base_headers.copy()
             m["Connection"] = f"close, {h_strip}"
@@ -1113,12 +1158,12 @@ class Pt403Bypass:
                 u = url_with_path(target, new_path)
                 add("path_case", "GET", u, base_headers.copy(), label=u)
 
-        # 9) Path tricks (bug-bounty style)
+        # 9) Path tricks
         for _label, new_path in extra_obfuscation_paths(parsed):
             u = merge_target_path(target, new_path)
             add("path_extra", "GET", u, base_headers.copy(), label=u)
 
-        # 10) HTTP protocol version (http_protocol_versions.txt): 2 / 1.1 / 1.0 / 0.9 …
+        # 10) HTTP protocol versions
         for tok in load_http_protocol_versions(tdir):
             lbl = _PROTOCOL_VERSION_LABELS.get(tok, f"GET HTTP/{tok}")
             add(
@@ -1247,19 +1292,11 @@ class Pt403Bypass:
         if respect_show_filter and not self._status_visible(status_code):
             return
         interesting = status_code != baseline_status
-        if (
-            self.args.show_statuses is None
-            and self._hide_baseline_matches
-            and not interesting
-            and not self.args.verbose
-        ):
-            return
         label = self._test_label(test)
         suffix = _format_status_suffix(response, colorize=interesting)
         self._print_result_line(label, suffix, colorize=interesting)
 
     def _print_addition_line(self, test: dict, response: requests.Response) -> None:
-        """Rows with HTTP status 0 (no valid response): informational only, not counted as findings."""
         if self.args.json:
             return
         label = self._test_label(test)
@@ -1302,7 +1339,6 @@ class Pt403Bypass:
         return _normalize_proxy_url(p)
 
     def _adapt_httpx_to_requests(self, resp) -> requests.Response:
-        """Map ``httpx.Response`` to a minimal ``requests.Response`` (status, body, headers, url)."""
         r = requests.Response()
         r.status_code = resp.status_code
         r._content = resp.content
@@ -1317,7 +1353,6 @@ class Pt403Bypass:
         headers: dict,
         auth: tuple[str, str] | None,
     ) -> requests.Response:
-        """HTTP/2 probe through CONNECT so Burp logs the same tunnel traffic as HTTP/1.x tests."""
         parsed = urlparse(url)
         scheme = (parsed.scheme or "http").lower()
         dummy = requests.Response()
@@ -1354,11 +1389,6 @@ class Pt403Bypass:
 
         try:
             if scheme == "https":
-                # FIX: Only advertise http/1.1 via ALPN so that http.client (which speaks
-                # HTTP/1.x text framing) can parse the response correctly.
-                # Advertising "h2" here causes the server to respond with binary HTTP/2
-                # frames that http.client.getresponse() cannot parse, resulting in a
-                # BadStatusLine exception and status_code = 0.
                 ssl_ctx = ssl.create_default_context()
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -1435,7 +1465,6 @@ class Pt403Bypass:
         headers: dict,
         auth: tuple[str, str] | None,
     ) -> requests.Response:
-        """HTTP/2 over ALPN (requires ``httpx`` + ``h2``)."""
         if self._proxy_url():
             return self._send_http2_via_connect_tunnel(url, method, headers, auth)
 
@@ -1478,7 +1507,6 @@ class Pt403Bypass:
         minor: int,
         no_host: bool,
     ) -> requests.Response:
-        """HTTP/1.x via ``http.client`` with an explicit request-line protocol version."""
         parsed = urlparse(url)
         scheme = (parsed.scheme or "http").lower()
         dummy = requests.Response()
@@ -1579,7 +1607,6 @@ class Pt403Bypass:
         headers: dict,
         auth: tuple[str, str] | None,
     ) -> requests.Response:
-        """HTTP/0.9: ``GET path`` only; response may be raw HTML or upgraded HTTP/1.x."""
         dummy = requests.Response()
         dummy.url = url
         if auth is not None:
@@ -1657,17 +1684,14 @@ class Pt403Bypass:
         auth: tuple[str, str] | None,
     ) -> requests.Response:
         if token == "2":
-            # Sends: GET /admin HTTP/2\r\nHost: ...\r\n...
             return self._send_via_http_client(url, method, headers, auth, major=2, minor=0, no_host=False)
         if token == "1.1":
             return self._send_via_http_client(url, method, headers, auth, major=1, minor=1, no_host=False)
         if token == "1.0":
             return self._send_via_http_client(url, method, headers, auth, major=1, minor=0, no_host=False)
         if token == "1.0-no-host":
-            # Sends HTTP/1.0 without Host header — can trigger unexpected server behaviour.
             return self._send_via_http_client(url, method, headers, auth, major=1, minor=0, no_host=True)
         if token == "0.9":
-            # Sends: GET /admin HTTP/0.9\r\nHost: ...\r\n...
             return self._send_via_http_client(url, method, headers, auth, major=0, minor=9, no_host=False)
 
         d = requests.Response()
@@ -1766,11 +1790,11 @@ def get_help():
             ["-H",  "--headers",               "<header:value>",  "Set custom header(s)"],
             ["-r",  "--redirects",             "",                "Follow redirects (default False)"],
             ["-s",  "--show-status",           "<code...>",       "Only print result lines with these HTTP status codes"],
-            ["-e",  "--hide-status",           "<code...>",       "Do not print lines with these HTTP status codes"],
+            ["-e",  "--hide-status",           "<code...>",       "Hide extra status codes in normal mode (default: 401 403 404; use -s to show them)"],
             ["-x",  "--methods",               "<method...>",     "HTTP methods (default: templates/methods.txt); merged with methods.txt"],
             ["-m",  "--max-tests",             "<n>",             "Limit payload count (default 0 = unlimited)"],
             ["-C",  "--cache",                 "",                "Cache compatibility flag"],
-            ["-vv", "--verbose",               "",                "Enable verbose mode (show all result lines)"],
+            ["-vv", "--verbose",               "",                "Verbose: show all lines except 401/403/404 (unless -s); same-as-baseline as ADDITIONS"],
             ["-v",  "--version",               "",                "Show script version and exit"],
             ["-h",  "--help",                  "",                "Show this help message and exit"],
             ["-j",  "--json",                  "",                "Output in JSON format"],
