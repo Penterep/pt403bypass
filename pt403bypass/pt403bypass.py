@@ -1020,8 +1020,8 @@ class Pt403Bypass:
     def _build_tests(self, target: str) -> list:
         parsed = urlparse(target)
         origin = f"{parsed.scheme}://{parsed.netloc}"
-        base_path = parsed.path if parsed.path else "/admin"
-        stripped = base_path.lstrip("/") or "admin"
+        base_path = parsed.path if parsed.path else "/"
+        stripped = base_path.lstrip("/")
         tdir = _templates_dir(self.args.templates_dir)
         base_headers = self.args.headers.copy()
         raw_ok = self._path_uses_raw()
@@ -1085,7 +1085,9 @@ class Pt403Bypass:
             add("header", "GET", target, m, header=rendered, label=lbl, use_raw=False)
 
         root_url = urlunparse(parsed._replace(path="/", params="", query="", fragment=""))
-        rewrite_variants: list[str] = [stripped, "/" + stripped]
+        rewrite_variants: list[str] = [v for v in [stripped, "/" + stripped] if v and v != "/"]
+        if not rewrite_variants:
+            rewrite_variants = ["/"]
         seen_rw: set[str] = set()
         for rewrite_val in rewrite_variants:
             if rewrite_val in seen_rw:
@@ -1813,7 +1815,7 @@ class Pt403Bypass:
         if not parsed.scheme:
             return f"https://{url}"
         if not parsed.path:
-            parsed = parsed._replace(path="/admin")
+            parsed = parsed._replace(path="/")
         return urlunparse(parsed)
 
 
