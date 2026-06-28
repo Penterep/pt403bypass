@@ -688,8 +688,7 @@ def merge_target_path(target: str, new_path: str) -> str:
 
 def _url_for_raw_request(url: str) -> str:
     p = urlparse(url)
-    raw_path = unquote(p.path or "/")
-    enc_path = quote(raw_path, safe="/")
+    enc_path = quote(p.path or "/", safe="/%")
     if p.query:
         raw_q = unquote(p.query)
         enc_query = quote(raw_q, safe="=&%+/:?-._~!$'()*,;@[]")
