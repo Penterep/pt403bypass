@@ -13,4 +13,6 @@ Authorization|Bearer undefined
 Authorization|Basic Og==
 Authorization|Basic AAAAA===
 Via|1.0 127.0.0.1
+Via|1.0 ::1
 Forwarded|for=127.0.0.1;by=127.0.0.1;proto=https
+Forwarded|for=::1;by=::1;proto=https
