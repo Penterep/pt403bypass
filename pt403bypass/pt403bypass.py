@@ -11,6 +11,7 @@ import argparse
 import base64
 import html
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -241,6 +242,30 @@ def _header_ip_pairs_from_files(templates_dir: str, hname: str, iname: str) -> l
 def load_header_ip_pairs(templates_dir: str) -> list[tuple[str, str]]:
     pairs = _header_ip_pairs_from_files(templates_dir, "source_ip_headers.txt", "ip.txt")
     return pairs if pairs is not None else []
+
+
+_HOST_LIKE_HEADERS = frozenset({
+    "host",
+    "x-forwarded-host",
+    "forwarded-host",
+    "proxy-host",
+    "x-host",
+    "x-http-host-override",
+})
+
+
+def _format_ip_for_header(header: str, value: str) -> str:
+    """RFC 7230: IPv6 literals in Host-style headers must use bracket form."""
+    if header.lower() not in _HOST_LIKE_HEADERS:
+        return value
+    if value.startswith("["):
+        return value
+    try:
+        if isinstance(ipaddress.ip_address(value), ipaddress.IPv6Address):
+            return f"[{value}]"
+    except ValueError:
+        pass
+    return value
 
 
 def load_path_payloads(templates_dir: str) -> list[str]:
@@ -1050,10 +1075,11 @@ class Pt403Bypass:
 
         # 2) source_ip_headers.txt × ip.txt
         for hname, hval in load_header_ip_pairs(tdir):
-            hdr = {hname: hval}
+            formatted = _format_ip_for_header(hname, hval)
+            hdr = {hname: formatted}
             m = base_headers.copy()
             m.update(hdr)
-            add("header", "GET", target, m, header=hdr, label=f"{hname}: {hval}", use_raw=False)
+            add("header", "GET", target, m, header=hdr, label=f"{hname}: {formatted}", use_raw=False)
 
         for hdrs in load_static_header_payloads(tdir):
             rendered = {k: v.format(path=base_path, origin=origin) for k, v in hdrs.items()}
