@@ -821,8 +821,10 @@ class Pt403Bypass:
         self.output_width = self._compute_output_width(tests, extra_labels=[target])
 
         baseline_status = baseline.status_code
+        baseline_fingerprint = self._response_fingerprint(baseline)
         if not self.args.json:
             self._print_baseline_warnings(baseline_status)
+            self._print_ignored_statuses()
             self._print_tested_url(target, baseline)
 
         # Group tests by section, then execute each section with threads
@@ -841,7 +843,7 @@ class Pt403Bypass:
             sections.append((current_section, current_group))
 
         for section_title, section_tests in sections:
-            self._run_section(section_title, section_tests, baseline_status)
+            self._run_section(section_title, section_tests, baseline_status, baseline_fingerprint)
 
         self._emit_results(len(tests))
 
@@ -854,6 +856,7 @@ class Pt403Bypass:
         section_title: str,
         tests: list[dict],
         baseline_status: int,
+        baseline_fingerprint: tuple,
     ) -> None:
         """Run all tests in a section using a thread pool; print results as they arrive."""
         # Submit all requests concurrently; preserve arrival order for output via future map
@@ -910,7 +913,7 @@ class Pt403Bypass:
 
                 # Immediate CLI output
                 if not self.args.json:
-                    should_print, as_addition = self._should_print_result(test, response, baseline_status)
+                    should_print, as_addition = self._should_print_result(test, response, baseline_status, baseline_fingerprint)
                     if should_print:
                         if not header_printed:
                             ptprint(f"Testing {section_title}:", "INFO", condition=True, colortext=True)
@@ -918,49 +921,38 @@ class Pt403Bypass:
                         if as_addition:
                             self._print_addition_line(test, response)
                         else:
-                            self._print_test_line(test, baseline_status, response, respect_show_filter=False)
+                            self._print_test_line(test, baseline_status, response, baseline_fingerprint=baseline_fingerprint, respect_show_filter=False)
 
     # ------------------------------------------------------------------
     # Visibility / filter helpers
     # ------------------------------------------------------------------
 
-    def _is_default_hidden_status(self, status_code: int) -> bool:
-        """401/403/404 are never printed unless explicitly whitelisted via -s."""
-        if status_code not in DEFAULT_HIDE_STATUSES:
-            return False
-        if self.args.show_statuses is not None and status_code in self.args.show_statuses:
-            return False
-        return True
-
-    def _is_suppressed_by_hide_flag(self, status_code: int) -> bool:
-        if not self.args.hide_statuses or status_code not in self.args.hide_statuses:
-            return False
-        if self.args.show_statuses is not None and status_code in self.args.show_statuses:
-            return False
-        return True
-
     def _is_status_hidden(self, status_code: int) -> bool:
-        if self._is_default_hidden_status(status_code):
-            return True
         if self.args.verbose:
+            hidden = self.args.hide_statuses
+        else:
+            hidden = DEFAULT_HIDE_STATUSES | self.args.hide_statuses
+        if status_code not in hidden:
             return False
-        return self._is_suppressed_by_hide_flag(status_code)
+        if self.args.show_statuses is not None and status_code in self.args.show_statuses:
+            return False
+        return True
 
     def _should_print_result(
         self,
         test: dict,
         response: requests.Response,
         baseline_status: int,
+        baseline_fingerprint: tuple,
     ) -> tuple[bool, bool]:
         """Return (should_print, as_addition).
 
         Rules (in priority order):
-        1. status_code == 0  → always print as ADDITIONS (no filter applied).
-        2. 401/403/404         → never print unless listed in -s (all modes, including -vv).
-        3. -vv (verbose)     → print remaining lines; same-as-baseline as ADDITIONS.
-        4. -e filter         → skip in normal mode only.
-        5. -s filter         → only print if status in show_statuses.
-        6. Baseline status filter (no -vv): skip if status matches baseline.
+        1. status_code == 0 → always print as ADDITIONS.
+        2. Hidden codes: verbose → only explicit -e; non-verbose → defaults + explicit -e.
+        3. -vv → print everything else; same fingerprint as baseline as ADDITIONS.
+        4. -s → only print if status in show_statuses.
+        5. Baseline fingerprint filter (non-vv): skip if fingerprint matches baseline.
         """
         status_code = response.status_code
 
@@ -968,26 +960,22 @@ class Pt403Bypass:
         if status_code == 0:
             return True, True
 
-        # Rule 2: 401/403/404 unless explicitly -s
-        if self._is_default_hidden_status(status_code):
+        # Rule 2: hidden codes (verbose ignores defaults, only explicit -e applies)
+        if self._is_status_hidden(status_code):
             return False, False
 
         verbose = self.args.verbose
 
-        # Rule 3: verbose mode — show everything else; same status as baseline as ADDITIONS
+        # Rule 3: verbose mode — show everything else; same fingerprint as baseline as ADDITIONS
         if verbose:
-            return True, status_code == baseline_status
+            return True, self._response_fingerprint(response) == baseline_fingerprint
 
-        # Rule 4: -e (normal mode only; -s overrides -e for the same code)
-        if self._is_suppressed_by_hide_flag(status_code):
-            return False, False
-
-        # Rule 5: -s (show_statuses whitelist; -s overrides baseline-status dedup)
+        # Rule 4: -s (show_statuses whitelist; overrides baseline-fingerprint dedup)
         if self.args.show_statuses is not None:
             return status_code in self.args.show_statuses, False
 
-        # Rule 6: same HTTP status as baseline
-        if status_code == baseline_status:
+        # Rule 5: same fingerprint as baseline
+        if self._response_fingerprint(response) == baseline_fingerprint:
             return False, False
 
         return True, False
@@ -1229,6 +1217,20 @@ class Pt403Bypass:
             return "HTTP protocol version"
         return "other tests"
 
+    def _print_ignored_statuses(self) -> None:
+        if self.args.verbose:
+            effective = self.args.hide_statuses
+        else:
+            effective = DEFAULT_HIDE_STATUSES | self.args.hide_statuses
+        if self.args.show_statuses:
+            effective -= self.args.show_statuses
+        codes = sorted(effective)
+        if not codes:
+            return
+        codes_str = ", ".join(str(c) for c in codes)
+        ptprint(f"Ignored status codes: {codes_str}", "INFO", condition=True, colortext=True)
+        ptprint("Use -e to specify your choice", "ADDITIONS", condition=True, indent=4, colortext=True)
+
     def _print_baseline_warnings(self, status_code: int) -> None:
         if self.args.json:
             return
@@ -1310,6 +1312,7 @@ class Pt403Bypass:
         baseline_status: int,
         response: requests.Response,
         *,
+        baseline_fingerprint: tuple | None = None,
         respect_show_filter: bool = True,
     ) -> None:
         if self.args.json:
@@ -1317,7 +1320,10 @@ class Pt403Bypass:
         status_code = response.status_code
         if respect_show_filter and not self._status_visible(status_code):
             return
-        interesting = status_code != baseline_status
+        if baseline_fingerprint is not None:
+            interesting = self._response_fingerprint(response) != baseline_fingerprint
+        else:
+            interesting = status_code != baseline_status
         label = self._test_label(test)
         suffix = _format_status_suffix(response, colorize=interesting)
         self._print_result_line(label, suffix, colorize=interesting)
@@ -1326,13 +1332,17 @@ class Pt403Bypass:
         if self.args.json:
             return
         label = self._test_label(test)
-        suffix = _display_http_status(response.status_code)
-        detail = (response.content or b"").decode("utf-8", "replace").strip()
-        if detail:
-            detail = " ".join(detail.split())
-            if len(detail) > 72:
-                detail = detail[:69] + "..."
-            suffix = f"{suffix} {detail}"
+        status_code = response.status_code
+        if status_code == 0:
+            suffix = _display_http_status(0)
+            detail = (response.content or b"").decode("utf-8", "replace").strip()
+            if detail:
+                detail = " ".join(detail.split())
+                if len(detail) > 72:
+                    detail = detail[:69] + "..."
+                suffix = f"{suffix} {detail}"
+        else:
+            suffix = _format_status_suffix(response, colorize=False)
         if len(label) <= self.output_width:
             line = f"{label:<{self.output_width}}  {suffix}"
             ptprint(line, "ADDITIONS", condition=not self.args.json, indent=4, colortext=True)
@@ -1346,6 +1356,17 @@ class Pt403Bypass:
         if not labels:
             return 34
         return max(34, min(96, max(len(label) for label in labels) + 2))
+
+    def _response_fingerprint(self, response: requests.Response) -> tuple:
+        status = response.status_code
+        if status == 200:
+            title = _extract_page_title(response.content or b"") or "-"
+            length = len(response.content or b"")
+            return (status, length, title)
+        if _is_redirect_status(status):
+            target = _redirect_target(response)
+            return (status, target)
+        return (status,)
 
     def _is_bypass(self, baseline: int, candidate: int) -> bool:
         if candidate == 0:
@@ -1853,7 +1874,7 @@ def parse_args():
         dest="hide_statuses",
         type=int,
         nargs="+",
-        default=sorted(DEFAULT_HIDE_STATUSES),
+        default=None,
         metavar="CODE",
     )
     parser.add_argument("-x",  "--methods",        type=lambda s: s.upper(), nargs="+", default=default_methods_for_argparse())
@@ -1875,7 +1896,8 @@ def parse_args():
 
     args = parser.parse_args()
 
-    args.hide_statuses = frozenset(args.hide_statuses)
+    args.hide_statuses_explicit = args.hide_statuses is not None
+    args.hide_statuses = frozenset(args.hide_statuses) if args.hide_statuses else frozenset()
     if args.show_statuses is not None:
         args.show_statuses = frozenset(args.show_statuses)
 
