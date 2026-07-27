@@ -18,6 +18,7 @@ import re
 import socket
 import ssl
 import sys
+import threading
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -188,6 +189,19 @@ def _remap_requests_exception_ptlibs(exc: requests.RequestException) -> requests
     except requests.RequestException as remapped:
         return remapped
     return exc
+
+
+def _describe_raw_network_error(exc: Exception) -> str:
+    """Map a low-level socket/SSL error from the raw HTTP client to the same
+    short wording used for equivalent `requests` failures, so both paths
+    produce identical result lines."""
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "Request timed out"
+    if "connection refused" in str(exc).lower():
+        return "Connection refused by the server"
+    if isinstance(exc, ssl.SSLError):
+        return "SSL error occured"
+    return "Connection error occurred"
 
 
 def _templates_dir(explicit: str | None) -> str:
@@ -790,6 +804,7 @@ def _adapt_raw_to_requests_like(raw) -> requests.Response:
 
 class Pt403Bypass:
     RAW_TYPES = frozenset({"path", "path_mid", "path_end", "path_ext", "path_case", "path_extra"})
+    CONN_FAIL_ABORT_THRESHOLD = 6
 
     def __init__(self, args):
         self.ptjsonlib = ptjsonlib.PtJsonLib()
@@ -797,6 +812,10 @@ class Pt403Bypass:
         self.findings = []
         self.output_width = 34
         self._raw_client = RawHttpClient() if RawHttpClient is not None else None
+        self._conn_fail_lock = threading.Lock()
+        self._conn_fail_count = 0
+        self._any_test_success = False
+        self._target_down = False
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -842,6 +861,8 @@ class Pt403Bypass:
             sections.append((current_section, current_group))
 
         for section_title, section_tests in sections:
+            if self._target_down:
+                break
             self._run_section(section_title, section_tests, baseline_status, baseline_fingerprint)
 
         self._emit_results(len(tests))
@@ -883,6 +904,11 @@ class Pt403Bypass:
                 future_to_idx[f] = idx
 
             for f in as_completed(future_to_idx):
+                if self._target_down:
+                    for other in future_to_idx:
+                        other.cancel()
+                    break
+
                 idx = future_to_idx[f]
                 test = tests[idx]
                 try:
@@ -896,6 +922,7 @@ class Pt403Bypass:
                 results.append((idx, test, response))
 
                 status_code = response.status_code
+                self._record_connection_result(status_code)
 
                 # Findings
                 if self._is_bypass(baseline_status, status_code):
@@ -921,6 +948,37 @@ class Pt403Bypass:
                             self._print_addition_line(test, response)
                         else:
                             self._print_test_line(test, baseline_status, response, baseline_fingerprint=baseline_fingerprint, respect_show_filter=False)
+
+    def _record_connection_result(self, status_code: int) -> None:
+        """Track connection-level failures (status 0) across the run. If we
+        never see a single real response after the baseline succeeded, the
+        target has most likely gone down mid-scan (or raw sockets can't
+        reach it at all) -- keep grinding through every remaining payload
+        against a dead target is pointless, so flag an abort once. A single
+        real response at any point (even a blocked/filtered one) cancels
+        this: selective connection resets from a WAF are useful bypass
+        signal, not a dead target, and must not trigger an abort."""
+        if status_code != 0:
+            self._any_test_success = True
+            return
+        if self._any_test_success or self._target_down:
+            return
+        just_tripped = False
+        with self._conn_fail_lock:
+            if self._any_test_success or self._target_down:
+                return
+            self._conn_fail_count += 1
+            if self._conn_fail_count >= self.CONN_FAIL_ABORT_THRESHOLD:
+                self._target_down = True
+                just_tripped = True
+        if just_tripped and not self.args.json:
+            ptprint(
+                f"Target seems unreachable ({self._conn_fail_count}x connection failure in a row) "
+                "- aborting remaining tests.",
+                "INFO",
+                condition=True,
+                colortext=True,
+            )
 
     # ------------------------------------------------------------------
     # Visibility / filter helpers
@@ -1020,8 +1078,8 @@ class Pt403Bypass:
     def _build_tests(self, target: str) -> list:
         parsed = urlparse(target)
         origin = f"{parsed.scheme}://{parsed.netloc}"
-        base_path = parsed.path if parsed.path else "/admin"
-        stripped = base_path.lstrip("/") or "admin"
+        base_path = parsed.path if parsed.path else "/"
+        stripped = base_path.lstrip("/")
         tdir = _templates_dir(self.args.templates_dir)
         base_headers = self.args.headers.copy()
         raw_ok = self._path_uses_raw()
@@ -1085,7 +1143,9 @@ class Pt403Bypass:
             add("header", "GET", target, m, header=rendered, label=lbl, use_raw=False)
 
         root_url = urlunparse(parsed._replace(path="/", params="", query="", fragment=""))
-        rewrite_variants: list[str] = [stripped, "/" + stripped]
+        rewrite_variants: list[str] = [v for v in [stripped, "/" + stripped] if v and v != "/"]
+        if not rewrite_variants:
+            rewrite_variants = ["/"]
         seen_rw: set[str] = set()
         for rewrite_val in rewrite_variants:
             if rewrite_val in seen_rw:
@@ -1801,6 +1861,16 @@ class Pt403Bypass:
                     proxies=self.args.proxy if self.args.proxy else None,
                 )
                 return _adapt_raw_to_requests_like(raw)
+            except (socket.timeout, ssl.SSLError, OSError) as exc:
+                # Network-level failure (e.g. connection refused/timeout): a
+                # fallback via requests would hit the same socket and fail the
+                # same way, so skip the redundant connection attempt and the
+                # duplicate verbose print that would otherwise precede it.
+                dummy = requests.Response()
+                dummy.status_code = 0
+                dummy._content = _describe_raw_network_error(exc).encode()
+                dummy.url = url
+                return dummy
             except Exception as exc:
                 if self.args.verbose:
                     u = url if len(url) <= 80 else url[:77] + "..."
@@ -1813,7 +1883,7 @@ class Pt403Bypass:
         if not parsed.scheme:
             return f"https://{url}"
         if not parsed.path:
-            parsed = parsed._replace(path="/admin")
+            parsed = parsed._replace(path="/")
         return urlunparse(parsed)
 
 
