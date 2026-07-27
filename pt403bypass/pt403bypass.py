@@ -859,7 +859,7 @@ class Pt403Bypass:
     ) -> None:
         """Run all tests in a section using a thread pool; print results as they arrive."""
         # Submit all requests concurrently; preserve arrival order for output via future map
-        max_workers = min(10, len(tests))
+        max_workers = min(self.args.threads, len(tests))
         futures: list = []  # (future, test)
 
         header_printed = False
@@ -1839,6 +1839,7 @@ def get_help():
             ["-e",  "--hide-status",           "<code...>",       "Hide extra status codes in normal mode (default: 401 403 404; use -s to show them)"],
             ["-x",  "--methods",               "<method...>",     "HTTP methods (default: templates/methods.txt); merged with methods.txt"],
             ["-m",  "--max-tests",             "<n>",             "Limit payload count (default 0 = unlimited)"],
+            ["-t",  "--threads",               "<n>",             "Number of concurrent threads per test section (default 10)"],
             ["-C",  "--cache",                 "",                "Cache compatibility flag"],
             ["-vv", "--verbose",               "",                "Verbose: show all lines except 401/403/404 (unless -s); same-as-baseline as ADDITIONS"],
             ["-v",  "--version",               "",                "Show script version and exit"],
@@ -1878,6 +1879,7 @@ def parse_args():
     )
     parser.add_argument("-x",  "--methods",        type=lambda s: s.upper(), nargs="+", default=default_methods_for_argparse())
     parser.add_argument("-m",  "--max-tests",      type=int, default=0)
+    parser.add_argument("-t",  "--threads",        type=int, default=10)
     parser.add_argument("-C",  "--cache",          action="store_true")
     parser.add_argument("-j",  "--json",           action="store_true")
     parser.add_argument("-vv", "--verbose",        action="store_true", dest="verbose")
@@ -1894,6 +1896,9 @@ def parse_args():
         sys.exit(0)
 
     args = parser.parse_args()
+
+    if args.threads < 1:
+        args.threads = 1
 
     args.hide_statuses_explicit = args.hide_statuses is not None
     args.hide_statuses = frozenset(args.hide_statuses) if args.hide_statuses else frozenset()
