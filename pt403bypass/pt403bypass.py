@@ -985,16 +985,26 @@ class Pt403Bypass:
     # Visibility / filter helpers
     # ------------------------------------------------------------------
 
-    def _is_status_hidden(self, status_code: int) -> bool:
-        if self.args.verbose:
-            hidden = self.args.hide_statuses
-        else:
-            hidden = DEFAULT_HIDE_STATUSES | self.args.hide_statuses
-        if status_code not in hidden:
+    def _is_status_ignorable(self, status_code: int) -> bool:
+        """Would this status be hidden outside of -vv (defaults + explicit -e,
+        unless whitelisted via -s)? Used in -vv mode to dim these codes instead
+        of hiding them outright."""
+        ignorable = DEFAULT_HIDE_STATUSES | self.args.hide_statuses
+        if status_code not in ignorable:
             return False
         if self.args.show_statuses is not None and status_code in self.args.show_statuses:
             return False
         return True
+
+    def _is_status_hidden(self, status_code: int) -> bool:
+        if self.args.verbose:
+            hidden = self.args.hide_statuses
+            if status_code not in hidden:
+                return False
+            if self.args.show_statuses is not None and status_code in self.args.show_statuses:
+                return False
+            return True
+        return self._is_status_ignorable(status_code)
 
     def _should_print_result(
         self,
@@ -1008,7 +1018,9 @@ class Pt403Bypass:
         Rules (in priority order):
         1. status_code == 0 → always print as ADDITIONS.
         2. Hidden codes: verbose → only explicit -e; non-verbose → defaults + explicit -e.
-        3. -vv → print everything else; same fingerprint as baseline as ADDITIONS.
+        3. -vv → print everything else; same fingerprint as baseline, or an
+           otherwise-ignorable status (defaults / explicit -e, unless whitelisted
+           via -s), prints as ADDITIONS (dimmed).
         4. -s → only print if status in show_statuses.
         5. Baseline fingerprint filter (non-vv): skip if fingerprint matches baseline.
         """
@@ -1024,9 +1036,14 @@ class Pt403Bypass:
 
         verbose = self.args.verbose
 
-        # Rule 3: verbose mode — show everything else; same fingerprint as baseline as ADDITIONS
+        # Rule 3: verbose mode — show everything else; same fingerprint as baseline
+        # or an otherwise-ignorable status code (defaults / explicit -e) as ADDITIONS
         if verbose:
-            return True, self._response_fingerprint(response) == baseline_fingerprint
+            as_addition = (
+                self._is_status_ignorable(status_code)
+                or self._response_fingerprint(response) == baseline_fingerprint
+            )
+            return True, as_addition
 
         # Rule 4: -s (show_statuses whitelist; overrides baseline-fingerprint dedup)
         if self.args.show_statuses is not None:
