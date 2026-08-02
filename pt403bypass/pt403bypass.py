@@ -940,6 +940,15 @@ class Pt403Bypass:
 
                 # Immediate CLI output
                 if not self.args.json:
+                    # Worker threads (_send / _send_via_http_client / ...) stash verbose
+                    # notes instead of printing directly -- ptprint() isn't safe to call
+                    # concurrently from multiple threads (races with the main thread's own
+                    # output and with ptlibs' SIGINT handler, causing a reentrant-call
+                    # crash on Ctrl+C), so print them here, serialized on the main thread.
+                    note = getattr(response, "_verbose_note", None)
+                    if note:
+                        ptprint(note, "INFO", condition=True, colortext=True)
+
                     should_print, as_addition = self._should_print_result(test, response, baseline_status, baseline_fingerprint)
                     if should_print:
                         if not header_printed:
@@ -1573,7 +1582,7 @@ class Pt403Bypass:
             dummy.status_code = 0
             dummy._content = str(exc).encode()
             if self.args.verbose:
-                ptprint(f"HTTP/2 (CONNECT) request failed ({url}): {exc}", "INFO", condition=True, colortext=True)
+                dummy._verbose_note = f"HTTP/2 (CONNECT) request failed ({url}): {exc}"
             return dummy
         finally:
             if tunneled_sock is not None:
@@ -1617,7 +1626,7 @@ class Pt403Bypass:
             dummy.status_code = 0
             dummy._content = str(exc).encode()
             if self.args.verbose:
-                ptprint(f"HTTP/2 request failed ({url}): {exc}", "INFO", condition=True, colortext=True)
+                dummy._verbose_note = f"HTTP/2 request failed ({url}): {exc}"
             return dummy
 
     def _send_via_http_client(
@@ -1709,7 +1718,7 @@ class Pt403Bypass:
             dummy.status_code = 0
             dummy._content = str(exc).encode()
             if self.args.verbose:
-                ptprint(f"HTTP/{major}.{minor} request failed ({url}): {exc}", "INFO", condition=True, colortext=True)
+                dummy._verbose_note = f"HTTP/{major}.{minor} request failed ({url}): {exc}"
             return dummy
         else:
             r = requests.Response()
@@ -1760,16 +1769,12 @@ class Pt403Bypass:
         timeout = self.args.timeout
 
         if proxy_url and scheme == "http":
-            if self.args.verbose:
-                ptprint(
-                    "HTTP/0.9 via proxy sends non-standard request line; proxy may reject it.",
-                    "INFO",
-                    condition=True,
-                    colortext=True,
-                )
             hdrs = {str(k): str(v) for k, v in headers.items()}
             raw = _proxy_forward_request("GET", url, "HTTP/0.9", hdrs, proxy_url, timeout)
-            return _response_from_http09_raw(raw, url)
+            resp = _response_from_http09_raw(raw, url)
+            if self.args.verbose:
+                resp._verbose_note = "HTTP/0.9 via proxy sends non-standard request line; proxy may reject it."
+            return resp
 
         try:
             ssl_ctx: ssl.SSLContext | None = None
@@ -1890,10 +1895,11 @@ class Pt403Bypass:
                 dummy.url = url
                 return dummy
             except Exception as exc:
+                fallback = self._send_via_requests(url, method, headers, auth)
                 if self.args.verbose:
                     u = url if len(url) <= 80 else url[:77] + "..."
-                    ptprint(f"Raw HTTP failed ({u}): {exc}", "INFO", condition=True, colortext=True)
-                return self._send_via_requests(url, method, headers, auth)
+                    fallback._verbose_note = f"Raw HTTP failed ({u}): {exc}"
+                return fallback
         return self._send_via_requests(url, method, headers, auth)
 
     def _normalize_target(self, url: str) -> str:
