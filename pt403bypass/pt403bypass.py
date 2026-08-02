@@ -40,6 +40,7 @@ from ptlibs.ptprinthelper import ptprint
 
 
 WHITE = "\033[97m"
+GRAY = "\033[90m"
 GREEN = "\033[32m"
 RED = "\033[31m"
 RESET = "\033[0m"
@@ -1319,9 +1320,9 @@ class Pt403Bypass:
         else:
             self._print_result_line(url, _format_status_suffix(response))
 
-    def _print_result_line(self, label: str, suffix: str, *, colorize: bool = False) -> None:
+    def _print_result_line(self, label: str, suffix: str, *, colorize: bool = False, color: str = WHITE) -> None:
         indent = "    "
-        prefix = f"{WHITE}{indent}" if colorize else indent
+        prefix = f"{color}{indent}" if colorize else indent
         reset = RESET if colorize else ""
         suffix_part = f"  {suffix}"
         link_url = label if _is_web_url(label) else None
@@ -1406,7 +1407,7 @@ class Pt403Bypass:
             line = f"{label:<{self.output_width}}  {suffix}"
             ptprint(line, "ADDITIONS", condition=not self.args.json, indent=4, colortext=True)
         else:
-            self._print_result_line(label, suffix)
+            self._print_result_line(label, suffix, colorize=True, color=GRAY)
 
     def _compute_output_width(self, tests: list, extra_labels: list | None = None) -> int:
         labels = list(extra_labels) if extra_labels else []
