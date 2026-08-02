@@ -15,6 +15,7 @@ import ipaddress
 import json
 import os
 import re
+import signal
 import socket
 import ssl
 import sys
@@ -34,9 +35,42 @@ except ImportError:
     RawHttpClient = None
 
 from _version import __version__
-from ptlibs import ptjsonlib, ptprinthelper, ptmisclib, ptnethelper
+from ptlibs import ptdefs, ptjsonlib, ptprinthelper, ptmisclib, ptnethelper
 from ptlibs.http.http_client import HttpClient
 from ptlibs.ptprinthelper import ptprint
+
+# ptlibs registers its own SIGINT handler on import (above), but that handler
+# isn't reentrant-safe: if SIGINT lands while this process is itself mid-write
+# to stdout (e.g. printing a result line), the handler's own print() call
+# raises RuntimeError("reentrant call inside <_io.BufferedWriter>") instead of
+# exiting cleanly. Wrap it so Ctrl+C always terminates without a traceback,
+# even on the rare occasion it can't get its own "Terminating..." message out.
+_ptlibs_sigint_handler = signal.getsignal(signal.SIGINT)
+
+
+def _sigint_handler(sig, frame):
+    try:
+        if callable(_ptlibs_sigint_handler):
+            _ptlibs_sigint_handler(sig, frame)
+    except RuntimeError:
+        # stdout's buffer was mid-write when SIGINT landed, so ptlibs' own
+        # print() couldn't get the "Terminating..." message out. Fall back to
+        # a raw write on stderr's fd -- a separate stream/buffer untouched by
+        # whatever stdout call was interrupted -- so the user still sees it.
+        script_name = os.path.basename(sys.argv[0]).split(".py")[0]
+        error, reset = ptdefs.colors["ERROR"], ptdefs.colors["TEXT"]
+        bullet = f"{error}[{ptdefs.chars['ERROR']}]{reset}"
+        try:
+            # \033[2K\r erases the current line (including the terminal's own
+            # "^C" echo) and returns to column 0, same as ptlibs' own attempt.
+            os.write(2, f"\033[2K\r\n{bullet} {error}Terminating {script_name}.{reset}\n".encode())
+        except OSError:
+            pass
+    finally:
+        os._exit(1)
+
+
+signal.signal(signal.SIGINT, _sigint_handler)
 
 
 WHITE = "\033[97m"
