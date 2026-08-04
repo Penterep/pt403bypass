@@ -82,6 +82,21 @@ RESET = "\033[0m"
 BLOCKED_STATUS_CODES: frozenset[int] = frozenset({401, 403})
 DEFAULT_HIDE_STATUSES: frozenset[int] = frozenset({401, 403, 404})
 
+TEST_TYPE_DESCRIPTIONS: tuple[tuple[str, str], ...] = (
+    ("method",         "Test HTTP method override bypass"),
+    ("header",         "Test HTTP request header spoofing/rewrite bypass"),
+    ("user_agent",     "Test User-Agent allowlisting bypass"),
+    ("path",           "Test URL path obfuscation bypass"),
+    ("path_mid",       "Test mid-path payload bypass"),
+    ("path_end",       "Test end-path payload bypass"),
+    ("path_ext",       "Test extension-suffix bypass"),
+    ("path_case",      "Test path case-variation bypass"),
+    ("path_extra",     "Test miscellaneous path-trick bypass"),
+    ("connection_hop", "Test hop-by-hop header stripping bypass"),
+    ("protocol",       "Test HTTP protocol-downgrade bypass"),
+)
+TEST_TYPES = tuple(name for name, _ in TEST_TYPE_DESCRIPTIONS)
+
 LONG_DOT_PREFIX = "./" * 64
 LONG_ENCODED_DOT_PREFIX = "%2F%2E" * 13
 
@@ -869,6 +884,14 @@ class Pt403Bypass:
             )
 
         tests = self._build_tests(target)
+        if self.args.tests:
+            unknown = sorted(set(self.args.tests) - set(TEST_TYPES))
+            if unknown:
+                self.ptjsonlib.end_error(
+                    f"Unknown test(s): {', '.join(unknown)}. Available: {', '.join(TEST_TYPES)}",
+                    self.args.json,
+                )
+            tests = [t for t in tests if t["type"] in self.args.tests]
         if self.args.max_tests > 0:
             tests = tests[: self.args.max_tests]
         self.output_width = self._compute_output_width(tests, extra_labels=[target])
@@ -986,7 +1009,7 @@ class Pt403Bypass:
                     should_print, as_addition = self._should_print_result(test, response, baseline_status, baseline_fingerprint)
                     if should_print:
                         if not header_printed:
-                            ptprint(f"Testing {section_title}:", "INFO", condition=True, colortext=True)
+                            ptprint(f"Testing {section_title}:", "INFO", condition=True, colortext=True, newline_above=True)
                             header_printed = True
                         if as_addition:
                             self._print_addition_line(test, response)
@@ -1115,7 +1138,7 @@ class Pt403Bypass:
                 )
                 self.ptjsonlib.add_vulnerability("PTV-WEB-403-BYPASS", details)
         else:
-            ptprint("No bypass found with the current payload set.", "INFO", condition=not self.args.json)
+            ptprint("No bypass found with the current payload set.", "INFO", condition=not self.args.json, newline_above=True)
 
         self.ptjsonlib.set_status("finished")
         result = self.ptjsonlib.get_result_json()
@@ -1373,7 +1396,7 @@ class Pt403Bypass:
         if self.args.json:
             return
         status_code = response.status_code
-        ptprint("Tested URL", "INFO", condition=True, colortext=True)
+        ptprint("Tested URL", "INFO", condition=True, colortext=True, newline_above=True)
         if status_code == 0:
             line = f"{url:<{self.output_width}}  {_format_status_suffix(response)}"
             ptprint(line, "ADDITIONS", condition=not self.args.json, indent=4, colortext=True)
@@ -1966,6 +1989,8 @@ def get_help():
             ["-s",  "--show-status",           "<code...>",       "Only print result lines with these HTTP status codes"],
             ["-e",  "--hide-status",           "<code...>",       "Hide extra status codes in normal mode (default: 401 403 404; use -s to show them)"],
             ["-x",  "--methods",               "<method...>",     "HTTP methods (default: templates/methods.txt); merged with methods.txt"],
+            ["-ts", "--tests",                 "<test...>",       "Specify one or more test group(s) to perform (default: all):"],
+            *[["", "", f" {name.upper()}", desc] for name, desc in TEST_TYPE_DESCRIPTIONS],
             ["-m",  "--max-tests",             "<n>",             "Limit payload count (default 0 = unlimited)"],
             ["-t",  "--threads",               "<n>",             "Number of concurrent threads per test section (default 10)"],
             ["-C",  "--cache",                 "",                "Cache compatibility flag"],
@@ -2006,6 +2031,7 @@ def parse_args():
         metavar="CODE",
     )
     parser.add_argument("-x",  "--methods",        type=lambda s: s.upper(), nargs="+", default=default_methods_for_argparse())
+    parser.add_argument("-ts", "--tests",          dest="tests", type=lambda s: s.lower(), nargs="+", default=None)
     parser.add_argument("-m",  "--max-tests",      type=int, default=0)
     parser.add_argument("-t",  "--threads",        type=int, default=10)
     parser.add_argument("-C",  "--cache",          action="store_true")
