@@ -81,6 +81,7 @@ RESET = "\033[0m"
 
 BLOCKED_STATUS_CODES: frozenset[int] = frozenset({401, 403})
 DEFAULT_HIDE_STATUSES: frozenset[int] = frozenset({401, 403, 404})
+MIN_REFLECTED_HEADER_VALUE_LEN = 6
 
 TEST_TYPE_DESCRIPTIONS: tuple[tuple[str, str], ...] = (
     ("method",         "Test HTTP method override bypass"),
@@ -1016,6 +1017,14 @@ class Pt403Bypass:
                         else:
                             self._print_test_line(test, baseline_status, response, baseline_fingerprint=baseline_fingerprint, respect_show_filter=False)
 
+        if not self.args.json:
+            reflection_rows = self._header_reflection_rows(results)
+            if reflection_rows:
+                if not header_printed:
+                    ptprint(f"Testing {section_title}:", "INFO", condition=True, colortext=True, newline_above=True)
+                    header_printed = True
+                self._print_header_reflection_rows(reflection_rows)
+
     def _record_connection_result(self, status_code: int) -> None:
         """Track connection-level failures (status 0) across the run. If we
         never see a single real response after the baseline succeeded, the
@@ -1510,6 +1519,48 @@ class Pt403Bypass:
             target = _redirect_target(response)
             return (status, target)
         return (status,)
+
+    def _reflected_header_values(self, test: dict, response: requests.Response) -> list[tuple[str, str, list[str]]]:
+        """Injected header (name, value, locations) triples from a 'header' test
+        whose value shows up verbatim in the response body and/or response
+        headers -- a sign the app may be echoing/trusting the spoofed header.
+        `locations` is a subset of ["body", "headers"]."""
+        if test["type"] != "header":
+            return []
+        header = test.get("header") or {}
+        if not header:
+            return []
+        body = (response.content or b"").decode("utf-8", errors="replace")
+        headers_text = "\n".join(f"{k}: {v}" for k, v in response.headers.items())
+        haystack = f"{body}\n{headers_text}"
+        if not haystack.strip():
+            return []
+        return [
+            (name, value)
+            for name, value in header.items()
+            if len(value) >= MIN_REFLECTED_HEADER_VALUE_LEN and value in haystack
+        ]
+
+    def _header_reflection_rows(self, results: list[tuple[int, dict, requests.Response]]) -> list[str]:
+        """Distinct injected header names whose value was reflected in the
+        response (body or headers) at least once across a section's results,
+        alphabetically sorted."""
+        names: set[str] = set()
+        for _idx, test, response in results:
+            header = test.get("header") if test["type"] == "header" else None
+            if not header:
+                continue
+            names.update(name for name, _value in self._reflected_header_values(test, response))
+        return sorted(names)
+
+    def _print_header_reflection_rows(self, rows: list[str]) -> None:
+        """Print the header names whose value came back in the response,
+        instead of tagging every single matching result line, which gets
+        unreadable when a target reflects nearly everything (e.g. a debug
+        page that dumps all request headers)."""
+        ptprint("Reflected in response:", "WARNING", condition=True, colortext=True, newline_above=True)
+        for name in rows:
+            print(f"    {name}")
 
     def _is_bypass(self, baseline: int, candidate: int) -> bool:
         if candidate == 0:
