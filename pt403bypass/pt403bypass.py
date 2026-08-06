@@ -1116,7 +1116,7 @@ class Pt403Bypass:
         if verbose:
             as_addition = (
                 self._is_status_ignorable(status_code)
-                or self._response_fingerprint(response) == baseline_fingerprint
+                or self._fingerprints_match(self._response_fingerprint(response), baseline_fingerprint)
             )
             return True, as_addition
 
@@ -1125,7 +1125,7 @@ class Pt403Bypass:
             return status_code in self.args.show_statuses, False
 
         # Rule 5: same fingerprint as baseline
-        if self._response_fingerprint(response) == baseline_fingerprint:
+        if self._fingerprints_match(self._response_fingerprint(response), baseline_fingerprint):
             return False, False
 
         return True, False
@@ -1473,7 +1473,7 @@ class Pt403Bypass:
         if respect_show_filter and not self._status_visible(status_code):
             return
         if baseline_fingerprint is not None:
-            interesting = self._response_fingerprint(response) != baseline_fingerprint
+            interesting = not self._fingerprints_match(self._response_fingerprint(response), baseline_fingerprint)
         else:
             interesting = status_code != baseline_status
         label = self._test_label(test)
@@ -1519,6 +1519,22 @@ class Pt403Bypass:
             target = _redirect_target(response)
             return (status, target)
         return (status,)
+
+    def _fingerprints_match(self, fingerprint: tuple, baseline_fingerprint: tuple) -> bool:
+        """Same as == comparison, except a status-200 length is allowed to differ
+        from the baseline by up to --length-round bytes and still count as a match."""
+        if fingerprint == baseline_fingerprint:
+            return True
+        length_round = self.args.length_round
+        if not length_round:
+            return False
+        if len(fingerprint) != 3 or len(baseline_fingerprint) != 3:
+            return False
+        status, length, title = fingerprint
+        baseline_status, baseline_length, baseline_title = baseline_fingerprint
+        if status != baseline_status or title != baseline_title:
+            return False
+        return abs(length - baseline_length) <= length_round
 
     def _reflected_header_values(self, test: dict, response: requests.Response) -> list[tuple[str, str, list[str]]]:
         """Injected header (name, value, locations) triples from a 'header' test
@@ -2045,6 +2061,7 @@ def get_help():
             ["-m",  "--max-tests",             "<n>",             "Limit payload count (default 0 = unlimited)"],
             ["-t",  "--threads",               "<n>",             "Number of concurrent threads per test section (default 10)"],
             ["-C",  "--cache",                 "",                "Cache compatibility flag"],
+            ["",    "--length-round",          "<bytes>",         "Treat responses within this many bytes of baseline length (same status & title) as a match (default 0 = exact)"],
             ["-vv", "--verbose",               "",                "Verbose: show all lines except 401/403/404 (unless -s); same-as-baseline as ADDITIONS"],
             ["-v",  "--version",               "",                "Show script version and exit"],
             ["-h",  "--help",                  "",                "Show this help message and exit"],
@@ -2086,6 +2103,7 @@ def parse_args():
     parser.add_argument("-m",  "--max-tests",      type=int, default=0)
     parser.add_argument("-t",  "--threads",        type=int, default=10)
     parser.add_argument("-C",  "--cache",          action="store_true")
+    parser.add_argument("--length-round",      dest="length_round", type=int, default=0, metavar="BYTES")
     parser.add_argument("-j",  "--json",           action="store_true")
     parser.add_argument("-vv", "--verbose",        action="store_true", dest="verbose")
 
@@ -2104,6 +2122,9 @@ def parse_args():
 
     if args.threads < 1:
         args.threads = 1
+
+    if args.length_round < 0:
+        args.length_round = 0
 
     args.hide_statuses_explicit = args.hide_statuses is not None
     args.hide_statuses = frozenset(args.hide_statuses) if args.hide_statuses else frozenset()
