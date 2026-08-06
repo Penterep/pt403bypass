@@ -884,6 +884,13 @@ class Pt403Bypass:
                 details=detail,
             )
 
+        homepage_target = self._homepage_target(target)
+        if homepage_target == target:
+            homepage = baseline
+        else:
+            homepage = self._send(homepage_target, "GET", self.args.headers.copy(), use_raw=False)
+        homepage_fingerprint = self._response_fingerprint(homepage) if homepage.status_code != 0 else None
+
         tests = self._build_tests(target)
         if self.args.tests:
             unknown = sorted(set(self.args.tests) - set(TEST_TYPES))
@@ -895,7 +902,8 @@ class Pt403Bypass:
             tests = [t for t in tests if t["type"] in self.args.tests]
         if self.args.max_tests > 0:
             tests = tests[: self.args.max_tests]
-        self.output_width = self._compute_output_width(tests, extra_labels=[target])
+        extra_labels = [target] if homepage_target == target else [target, homepage_target]
+        self.output_width = self._compute_output_width(tests, extra_labels=extra_labels)
 
         baseline_status = baseline.status_code
         baseline_fingerprint = self._response_fingerprint(baseline)
@@ -903,6 +911,8 @@ class Pt403Bypass:
             self._print_baseline_warnings(baseline_status)
             self._print_ignored_statuses()
             self._print_tested_url(target, baseline)
+            if homepage_target != target:
+                self._print_homepage_url(homepage_target, homepage)
 
         # Group tests by section, then execute each section with threads
         sections: list[tuple[str, list[dict]]] = []
@@ -922,7 +932,7 @@ class Pt403Bypass:
         for section_title, section_tests in sections:
             if self._target_down:
                 break
-            self._run_section(section_title, section_tests, baseline_status, baseline_fingerprint)
+            self._run_section(section_title, section_tests, baseline_status, baseline_fingerprint, homepage_fingerprint)
 
         self._emit_results(len(tests))
 
@@ -936,6 +946,7 @@ class Pt403Bypass:
         tests: list[dict],
         baseline_status: int,
         baseline_fingerprint: tuple,
+        homepage_fingerprint: tuple | None,
     ) -> None:
         """Run all tests in a section using a thread pool; print results as they arrive."""
         # Submit all requests concurrently; preserve arrival order for output via future map
@@ -1007,7 +1018,9 @@ class Pt403Bypass:
                     if note:
                         ptprint(note, "INFO", condition=True, colortext=True)
 
-                    should_print, as_addition = self._should_print_result(test, response, baseline_status, baseline_fingerprint)
+                    should_print, as_addition = self._should_print_result(
+                        test, response, baseline_status, baseline_fingerprint, homepage_fingerprint
+                    )
                     if should_print:
                         if not header_printed:
                             ptprint(f"Testing {section_title}:", "INFO", condition=True, colortext=True, newline_above=True)
@@ -1015,7 +1028,14 @@ class Pt403Bypass:
                         if as_addition:
                             self._print_addition_line(test, response)
                         else:
-                            self._print_test_line(test, baseline_status, response, baseline_fingerprint=baseline_fingerprint, respect_show_filter=False)
+                            self._print_test_line(
+                                test,
+                                baseline_status,
+                                response,
+                                baseline_fingerprint=baseline_fingerprint,
+                                homepage_fingerprint=homepage_fingerprint,
+                                respect_show_filter=False,
+                            )
 
         if not self.args.json:
             reflection_rows = self._header_reflection_rows(results)
@@ -1087,17 +1107,18 @@ class Pt403Bypass:
         response: requests.Response,
         baseline_status: int,
         baseline_fingerprint: tuple,
+        homepage_fingerprint: tuple | None = None,
     ) -> tuple[bool, bool]:
         """Return (should_print, as_addition).
 
         Rules (in priority order):
         1. status_code == 0 → always print as ADDITIONS.
         2. Hidden codes: verbose → only explicit -e; non-verbose → defaults + explicit -e.
-        3. -vv → print everything else; same fingerprint as baseline, or an
+        3. -vv → print everything else; same fingerprint as baseline or homepage, or an
            otherwise-ignorable status (defaults / explicit -e, unless whitelisted
            via -s), prints as ADDITIONS (dimmed).
         4. -s → only print if status in show_statuses.
-        5. Baseline fingerprint filter (non-vv): skip if fingerprint matches baseline.
+        5. Baseline/homepage fingerprint filter (non-vv): skip if fingerprint matches either.
         """
         status_code = response.status_code
 
@@ -1111,21 +1132,21 @@ class Pt403Bypass:
 
         verbose = self.args.verbose
 
-        # Rule 3: verbose mode — show everything else; same fingerprint as baseline
+        # Rule 3: verbose mode — show everything else; same fingerprint as baseline/homepage
         # or an otherwise-ignorable status code (defaults / explicit -e) as ADDITIONS
         if verbose:
             as_addition = (
                 self._is_status_ignorable(status_code)
-                or self._fingerprints_match(self._response_fingerprint(response), baseline_fingerprint)
+                or self._matches_known_good(response, baseline_fingerprint, homepage_fingerprint)
             )
             return True, as_addition
 
-        # Rule 4: -s (show_statuses whitelist; overrides baseline-fingerprint dedup)
+        # Rule 4: -s (show_statuses whitelist; overrides baseline/homepage-fingerprint dedup)
         if self.args.show_statuses is not None:
             return status_code in self.args.show_statuses, False
 
-        # Rule 5: same fingerprint as baseline
-        if self._fingerprints_match(self._response_fingerprint(response), baseline_fingerprint):
+        # Rule 5: same fingerprint as baseline or homepage
+        if self._matches_known_good(response, baseline_fingerprint, homepage_fingerprint):
             return False, False
 
         return True, False
@@ -1412,6 +1433,17 @@ class Pt403Bypass:
         else:
             self._print_result_line(url, _format_status_suffix(response))
 
+    def _print_homepage_url(self, url: str, response: requests.Response) -> None:
+        if self.args.json:
+            return
+        status_code = response.status_code
+        ptprint("Homepage", "INFO", condition=True, colortext=True, newline_above=True)
+        if status_code == 0:
+            line = f"{url:<{self.output_width}}  {_format_status_suffix(response)}"
+            ptprint(line, "ADDITIONS", condition=not self.args.json, indent=4, colortext=True)
+        else:
+            self._print_result_line(url, _format_status_suffix(response))
+
     def _print_result_line(self, label: str, suffix: str, *, colorize: bool = False, color: str = WHITE) -> None:
         indent = "    "
         prefix = f"{color}{indent}" if colorize else indent
@@ -1465,6 +1497,7 @@ class Pt403Bypass:
         response: requests.Response,
         *,
         baseline_fingerprint: tuple | None = None,
+        homepage_fingerprint: tuple | None = None,
         respect_show_filter: bool = True,
     ) -> None:
         if self.args.json:
@@ -1473,7 +1506,7 @@ class Pt403Bypass:
         if respect_show_filter and not self._status_visible(status_code):
             return
         if baseline_fingerprint is not None:
-            interesting = not self._fingerprints_match(self._response_fingerprint(response), baseline_fingerprint)
+            interesting = not self._matches_known_good(response, baseline_fingerprint, homepage_fingerprint)
         else:
             interesting = status_code != baseline_status
         label = self._test_label(test)
@@ -1535,6 +1568,21 @@ class Pt403Bypass:
         if status != baseline_status or title != baseline_title:
             return False
         return abs(length - baseline_length) <= length_round
+
+    def _matches_known_good(
+        self,
+        response: requests.Response,
+        baseline_fingerprint: tuple,
+        homepage_fingerprint: tuple | None,
+    ) -> bool:
+        """True if response matches the baseline or the homepage -- i.e. it's
+        not a real difference, just the target falling back to a known page."""
+        fingerprint = self._response_fingerprint(response)
+        if self._fingerprints_match(fingerprint, baseline_fingerprint):
+            return True
+        if homepage_fingerprint is not None and self._fingerprints_match(fingerprint, homepage_fingerprint):
+            return True
+        return False
 
     def _reflected_header_values(self, test: dict, response: requests.Response) -> list[tuple[str, str, list[str]]]:
         """Injected header (name, value, locations) triples from a 'header' test
@@ -2033,6 +2081,10 @@ class Pt403Bypass:
         if not parsed.path:
             parsed = parsed._replace(path="/")
         return urlunparse(parsed)
+
+    def _homepage_target(self, target: str) -> str:
+        parsed = urlparse(target)
+        return urlunparse(parsed._replace(path="/", params="", query="", fragment=""))
 
 
 def get_help():
