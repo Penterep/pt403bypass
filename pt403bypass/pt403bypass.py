@@ -1126,12 +1126,9 @@ class Pt403Bypass:
 
     def _is_status_hidden(self, status_code: int) -> bool:
         if self.args.verbose:
-            hidden = self.args.hide_statuses
-            if status_code not in hidden:
-                return False
-            if self.args.show_statuses is not None and status_code in self.args.show_statuses:
-                return False
-            return True
+            # -vv never truly hides anything -- explicit -e codes are dimmed
+            # (as_addition) by Rule 3 in _should_print_result instead.
+            return False
         return self._is_status_ignorable(status_code)
 
     def _should_print_result(
