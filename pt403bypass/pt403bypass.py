@@ -854,6 +854,9 @@ class Pt403Bypass:
         self.args = args
         self.findings = []
         self.output_width = 34
+        # (test, response_length) for every 200 response whose title matches the
+        # tested page's title but whose size differs -- see _print_size_variance_summary.
+        self._title_match_samples: list[tuple[dict, int, str]] = []
         self._http_client = HttpClient(args=args, ptjsonlib=self.ptjsonlib)
         self._raw_client = RawHttpClient() if RawHttpClient is not None else None
         self._conn_fail_lock = threading.Lock()
@@ -900,6 +903,10 @@ class Pt403Bypass:
 
         baseline_status = baseline.status_code
         baseline_fingerprint = self._response_fingerprint(baseline)
+        baseline_title = _extract_page_title(baseline.content or b"") or "-"
+        baseline_length = len(baseline.content or b"")
+        homepage_title = _extract_page_title(homepage.content or b"") or "-"
+        homepage_length = len(homepage.content or b"")
         if not self.args.json:
             self._print_baseline_warnings(baseline_status)
             self._print_ignored_statuses()
@@ -925,8 +932,20 @@ class Pt403Bypass:
         for section_title, section_tests in sections:
             if self._target_down:
                 break
-            self._run_section(section_title, section_tests, baseline_status, baseline_fingerprint, homepage_fingerprint)
+            self._run_section(
+                section_title,
+                section_tests,
+                baseline_status,
+                baseline_fingerprint,
+                homepage_fingerprint,
+                baseline_title,
+                baseline_length,
+                homepage_title,
+                homepage_length,
+            )
 
+        if not self.args.json:
+            self._print_size_variance_summary()
         self._emit_results(len(tests))
 
     # ------------------------------------------------------------------
@@ -940,6 +959,10 @@ class Pt403Bypass:
         baseline_status: int,
         baseline_fingerprint: tuple,
         homepage_fingerprint: tuple | None,
+        baseline_title: str,
+        baseline_length: int,
+        homepage_title: str,
+        homepage_length: int,
     ) -> None:
         """Run all tests in a section using a thread pool; print results as they arrive."""
         # Submit all requests concurrently; preserve arrival order for output via future map
@@ -986,6 +1009,23 @@ class Pt403Bypass:
 
                 status_code = response.status_code
                 self._record_connection_result(status_code)
+
+                # Size-variance tracking (PT-1406): a 200 response reusing the
+                # tested page's title (baseline or homepage -- the baseline
+                # itself often has no title at all, e.g. a plain 404/403 page),
+                # but at a different size, likely means this payload reached
+                # the same underlying page -- collect it so we can report the
+                # size spread once enough of these show up.
+                if status_code == 200:
+                    length = len(response.content or b"")
+                    title = _extract_page_title(response.content or b"")
+                    # "-" means no <title> was found at all -- never treat that
+                    # as a match, or every title-less page would look identical.
+                    if title:
+                        if title == baseline_title and length != baseline_length:
+                            self._title_match_samples.append((test, length, title))
+                        elif title == homepage_title and length != homepage_length:
+                            self._title_match_samples.append((test, length, title))
 
                 # Findings
                 if self._is_bypass(baseline_status, status_code):
@@ -1150,6 +1190,37 @@ class Pt403Bypass:
         if self.args.show_statuses is not None:
             return status_code in self.args.show_statuses
         return True
+
+    def _print_size_variance_summary(self) -> None:
+        """PT-1406: if more than 5 payloads returned a 200 response reusing the
+        tested page's title but at a different size, report the smallest and
+        largest of those sizes (and which test(s) produced them) at the end
+        of the run."""
+        samples = self._title_match_samples
+        if len(samples) <= 5:
+            return
+        lengths = [length for _test, length, _title in samples]
+        min_length, max_length = min(lengths), max(lengths)
+        min_tests = [test for test, length, _title in samples if length == min_length]
+        max_tests = [test for test, length, _title in samples if length == max_length]
+        title = samples[0][2]
+
+        ptprint(
+            f'Response size variance ({len(samples)} matches, title "{title}")',
+            "INFO", condition=True, colortext=True, newline_above=True,
+        )
+        value_width = max(len(str(min_length)), len(str(max_length)))
+        blank_prefix = " " * (6 + 3 + 1 + value_width + 5)
+        for row_label, length, tests in (("MIN", min_length, min_tests), ("MAX", max_length, max_tests)):
+            first = True
+            for test in tests:
+                payload = self._test_label(test)
+                if first:
+                    line = f"      {row_label:<3} {length:>{value_width}} B   {payload}"
+                    first = False
+                else:
+                    line = f"{blank_prefix}{payload}"
+                ptprint(f"{WHITE}{line}{RESET}", "TEXT", condition=True)
 
     def _emit_results(self, tested_count: int) -> None:
         if self.findings:
