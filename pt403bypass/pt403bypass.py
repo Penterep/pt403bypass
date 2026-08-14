@@ -234,14 +234,6 @@ def _format_label_text(
     return f"{visible}{' ' * max(0, width - len(text))}"
 
 
-def _remap_requests_exception_ptlibs(exc: requests.RequestException) -> requests.RequestException:
-    try:
-        HttpClient._remap_requests_exception(None, exc)  # type: ignore[arg-type]
-    except requests.RequestException as remapped:
-        return remapped
-    return exc
-
-
 def _describe_raw_network_error(exc: Exception) -> str:
     """Map a low-level socket/SSL error from the raw HTTP client to the same
     short wording used for equivalent `requests` failures, so both paths
@@ -862,6 +854,7 @@ class Pt403Bypass:
         self.args = args
         self.findings = []
         self.output_width = 34
+        self._http_client = HttpClient(args=args, ptjsonlib=self.ptjsonlib)
         self._raw_client = RawHttpClient() if RawHttpClient is not None else None
         self._conn_fail_lock = threading.Lock()
         self._conn_fail_count = 0
@@ -1643,164 +1636,6 @@ class Pt403Bypass:
             return None
         return _normalize_proxy_url(p)
 
-    def _adapt_httpx_to_requests(self, resp) -> requests.Response:
-        r = requests.Response()
-        r.status_code = resp.status_code
-        r._content = resp.content
-        r.headers = CaseInsensitiveDict(dict(resp.headers))
-        r.url = str(resp.url)
-        return r
-
-    def _send_http2_via_connect_tunnel(
-        self,
-        url: str,
-        method: str,
-        headers: dict,
-        auth: tuple[str, str] | None,
-    ) -> requests.Response:
-        parsed = urlparse(url)
-        scheme = (parsed.scheme or "http").lower()
-        dummy = requests.Response()
-        dummy.url = url
-        if scheme not in ("http", "https"):
-            dummy.status_code = 0
-            dummy._content = b"HTTP/2: unsupported URL scheme"
-            return dummy
-
-        host = parsed.hostname
-        if not host:
-            dummy.status_code = 0
-            dummy._content = b"HTTP/2: missing hostname"
-            return dummy
-
-        port = parsed.port or (443 if scheme == "https" else 80)
-        path = parsed.path or "/"
-        if parsed.query:
-            path = f"{path}?{parsed.query}"
-
-        proxy_url = self._proxy_url()
-        if not proxy_url:
-            dummy.status_code = 0
-            dummy._content = b"HTTP/2: proxy URL missing"
-            return dummy
-
-        hdrs: dict[str, str] = {str(k): str(v) for k, v in headers.items()}
-        if auth is not None:
-            token = base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode()
-            hdrs["Authorization"] = f"Basic {token}"
-
-        timeout = self.args.timeout
-        tunneled_sock: socket.socket | None = None
-
-        try:
-            if scheme == "https":
-                ssl_ctx = ssl.create_default_context()
-                ssl_ctx.check_hostname = False
-                ssl_ctx.verify_mode = ssl.CERT_NONE
-                ssl_ctx.set_alpn_protocols(["http/1.1"])
-
-                tunneled_sock = _open_plain_target_socket(
-                    host, port, proxy_url=proxy_url, timeout=timeout,
-                )
-                conn = _http_client_connection_from_socket(
-                    tunneled_sock,
-                    host,
-                    port,
-                    1,
-                    1,
-                    timeout,
-                    scheme="https",
-                    ssl_context=ssl_ctx,
-                )
-                conn.request(method.upper(), path, body=None, headers=hdrs)
-                resp = conn.getresponse()
-                data = resp.read()
-                negotiated = None
-                if getattr(conn, "sock", None) is not None:
-                    negotiated = conn.sock.selected_alpn_protocol()
-                conn.close()
-                r = requests.Response()
-                r.status_code = resp.status
-                r._content = data
-                r.headers = CaseInsensitiveDict(dict(resp.headers))
-                if negotiated:
-                    r.headers["X-Negotiated-Protocol"] = negotiated
-                r.url = url
-                return r
-
-            tunneled_sock = _open_plain_target_socket(
-                host, port, proxy_url=proxy_url, timeout=timeout,
-            )
-            hdrs.setdefault("Host", host)
-            h2_settings = "AAMAAABkAAQCAAQA="
-            lines = [f"{method.upper()} {path} HTTP/1.1"]
-            for key, value in hdrs.items():
-                if key.lower() == "connection":
-                    continue
-                lines.append(f"{key}: {value}")
-            lines.extend([
-                "Connection: Upgrade, HTTP2-Settings",
-                "Upgrade: h2c",
-                f"HTTP2-Settings: {h2_settings}",
-                "",
-                "",
-            ])
-            tunneled_sock.sendall("\r\n".join(lines).encode("ascii", errors="strict"))
-            raw = _recv_http_bytes(tunneled_sock, timeout)
-            r = _parse_http_response(raw, url)
-            r.headers["X-Requested-Protocol"] = "h2c"
-            return r
-        except (OSError, TimeoutError, http.client.HTTPException, ssl.SSLError, ValueError) as exc:
-            dummy.status_code = 0
-            dummy._content = str(exc).encode()
-            if self.args.verbose:
-                dummy._verbose_note = f"HTTP/2 (CONNECT) request failed ({url}): {exc}"
-            return dummy
-        finally:
-            if tunneled_sock is not None:
-                try:
-                    tunneled_sock.close()
-                except OSError:
-                    pass
-
-    def _send_http2_httpx(
-        self,
-        url: str,
-        method: str,
-        headers: dict,
-        auth: tuple[str, str] | None,
-    ) -> requests.Response:
-        if self._proxy_url():
-            return self._send_http2_via_connect_tunnel(url, method, headers, auth)
-
-        dummy = requests.Response()
-        dummy.url = url
-        try:
-            import httpx
-        except ImportError:
-            dummy.status_code = 0
-            dummy._content = b"HTTP/2: install httpx and h2 (e.g. pip install 'httpx[http2]')"
-            return dummy
-        try:
-            client_kw: dict = {
-                "http2": True,
-                "verify": False,
-                "timeout": self.args.timeout,
-                "trust_env": False,
-            }
-            proxy = self._proxy_url()
-            if proxy:
-                client_kw["proxy"] = proxy
-            with httpx.Client(**client_kw) as client:
-                r = client.request(method.upper(), url, headers=headers, auth=auth)
-            return self._adapt_httpx_to_requests(r)
-        except Exception as exc:
-            dummy.status_code = 0
-            dummy._content = str(exc).encode()
-            if self.args.verbose:
-                dummy._verbose_note = f"HTTP/2 request failed ({url}): {exc}"
-            return dummy
-
     def _send_via_http_client(
         self,
         url: str,
@@ -2017,15 +1852,21 @@ class Pt403Bypass:
                 "proxies": self.args.proxy,
                 "allow_redirects": self.args.redirects,
                 "verify": False,
+                # Each test already builds its own final headers dict (that's
+                # the thing under test); HttpClient must send them as-is, not
+                # merge/override them with its own base headers.
+                "merge_headers": False,
             }
             if auth is not None:
                 kw["auth"] = auth
-            return requests.request(**kw)
-        except requests.RequestException as exc:
-            remapped = _remap_requests_exception_ptlibs(exc)
+            return self._http_client.send_request(**kw)
+        except Exception as exc:
+            # HttpClient.send_request() already remaps requests exceptions to
+            # shorter, consistent messages before raising (same remapping
+            # this tool used to do by hand via HttpClient._remap_requests_exception).
             dummy = requests.Response()
             dummy.status_code = 0
-            dummy._content = str(remapped).encode()
+            dummy._content = str(exc).encode()
             dummy.url = url
             return dummy
 
